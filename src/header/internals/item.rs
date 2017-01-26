@@ -34,6 +34,7 @@ impl Item {
 
     #[inline]
     pub fn mut_raw(&mut self) -> &mut Vec<Vec<u8>> {
+        self.raw();
         self.typed = PtrMapCell::new();
         unsafe {
             self.raw.get_mut()
