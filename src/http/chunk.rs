@@ -1,3 +1,5 @@
+extern crate owning_ref;
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -11,6 +13,7 @@ enum Inner {
     Referenced(Arc<Vec<u8>>),
     Mem(MemSlice),
     Static(&'static [u8]),
+    Box(self::owning_ref::ErasedBoxRef<[u8]>),
 }
 
 impl From<Vec<u8>> for Chunk {
@@ -54,6 +57,13 @@ impl From<MemSlice> for Chunk {
     }
 }
 
+impl<T: 'static + Send + Sync> From<owning_ref::BoxRef<T, [u8]>> for Chunk {
+    #[inline]
+    fn from(r: owning_ref::BoxRef<T, [u8]>) -> Chunk {
+        Chunk(Inner::Box(r.erase_owner()))
+    }
+}
+
 impl ::std::ops::Deref for Chunk {
     type Target = [u8];
 
@@ -71,6 +81,7 @@ impl AsRef<[u8]> for Chunk {
             Inner::Referenced(ref vec) => vec,
             Inner::Mem(ref slice) => slice.as_ref(),
             Inner::Static(slice) => slice,
+            Inner::Box(ref r) => &*r,
         }
     }
 }
