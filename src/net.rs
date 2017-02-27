@@ -262,6 +262,7 @@ impl NetworkListener for HttpListener {
     #[inline]
     fn accept(&mut self) -> ::Result<HttpStream> {
         let stream = HttpStream(try!(self.listener.accept()).0);
+        try!(stream.0.set_nodelay(true));
         try!(stream.set_read_timeout(self.read_timeout));
         try!(stream.set_write_timeout(self.write_timeout));
         Ok(stream)
