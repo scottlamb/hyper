@@ -378,6 +378,7 @@ impl<S, B> Server<S, B>
 
         // Future for our server's execution
         let srv = listener.incoming().for_each(|(socket, addr)| {
+            socket.set_nodelay(true)?;
             let s = NotifyService {
                 inner: try!(new_service.new_service()),
                 info: Rc::downgrade(&info),
