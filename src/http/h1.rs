@@ -560,6 +560,9 @@ impl<R> fmt::Debug for HttpReader<R> {
 
 impl<R: Read> Read for HttpReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         match *self {
             SizedReader(ref mut body, ref mut remaining) => {
                 trace!("Sized read, remaining={:?}", remaining);
@@ -588,12 +591,17 @@ impl<R: Read> Read for HttpReader<R> {
                 trace!("Chunked read, remaining={:?}", rem);
 
                 if rem == 0 {
+                    if opt_remaining.is_none() {
+                        try!(eat(body, LINE_ENDING.as_bytes()));
+                    }
+
                     *opt_remaining = Some(0);
 
                     // chunk of size 0 signals the end of the chunked stream
                     // if the 0 digit was missing from the stream, it would
                     // be an InvalidInput error instead.
                     trace!("end of chunked");
+
                     return Ok(0)
                 }
 
@@ -1074,6 +1082,38 @@ mod tests {
         let e = r.read(&mut buf).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Other);
         assert_eq!(e.description(), "early eof");
+    }
+
+    #[test]
+    fn test_read_sized_zero_len_buf() {
+        let mut r = super::HttpReader::SizedReader(MockStream::with_input(b"foo bar"), 7);
+        let mut buf = [0u8; 0];
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_read_chunked_zero_len_buf() {
+        let mut r = super::HttpReader::ChunkedReader(MockStream::with_input(b"\
+            7\r\n\
+            foo bar\
+            0\r\n\r\n\
+        "), None);
+
+        let mut buf = [0u8; 0];
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_read_chunked_fully_consumes() {
+        let mut r = super::HttpReader::ChunkedReader(MockStream::with_input(b"0\r\n\r\n"), None);
+        let mut buf = [0; 1];
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+
+        match r {
+            super::HttpReader::ChunkedReader(mut r, _) => assert_eq!(r.read(&mut buf).unwrap(), 0),
+            _ => unreachable!(),
+        }
     }
 
     #[test]
