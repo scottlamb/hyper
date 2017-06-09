@@ -26,7 +26,6 @@ pub struct Response {
 }
 
 impl Response {
-
     /// Creates a new response from a server.
     pub fn new(url: Url, stream: Box<NetworkStream + Send>) -> ::Result<Response> {
         trace!("Response::new");
@@ -62,6 +61,12 @@ impl Response {
     pub fn status_raw(&self) -> &RawStatus {
         &self.status_raw
     }
+
+    /// Gets a borrowed reference to the underlying `HttpMessage`.
+    #[inline]
+    pub fn get_ref(&self) -> &HttpMessage {
+        &*self.message
+    }
 }
 
 /// Read the response body.
@@ -90,7 +95,7 @@ impl Drop for Response {
         if !(is_drained && http::should_keep_alive(self.version, &self.headers)) {
             trace!("Response.drop closing connection");
             if let Err(e) = self.message.close_connection() {
-                error!("Response.drop error closing connection: {}", e);
+                info!("Response.drop error closing connection: {}", e);
             }
         }
     }

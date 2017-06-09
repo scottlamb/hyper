@@ -9,12 +9,22 @@ pub struct BufReader<R> {
 }
 
 const INIT_BUFFER_SIZE: usize = 4096;
-const MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
+pub const MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 
 impl<R: Read> BufReader<R> {
     #[inline]
     pub fn new(rdr: R) -> BufReader<R> {
         BufReader::with_capacity(rdr, INIT_BUFFER_SIZE)
+    }
+
+    #[inline]
+    pub fn from_parts(rdr: R, buf: Vec<u8>, pos: usize, cap: usize) -> BufReader<R> {
+        BufReader {
+            inner: rdr,
+            buf: buf,
+            pos: pos,
+            cap: cap,
+        }
     }
 
     #[inline]
@@ -64,6 +74,11 @@ impl<R: Read> BufReader<R> {
 
     #[inline]
     pub fn into_inner(self) -> R { self.inner }
+
+    #[inline]
+    pub fn into_parts(self) -> (R, Vec<u8>, usize, usize) {
+        (self.inner, self.buf, self.pos, self.cap)
+    }
 
     #[inline]
     pub fn read_into_buf(&mut self) -> io::Result<usize> {

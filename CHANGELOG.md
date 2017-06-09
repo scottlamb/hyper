@@ -1,3 +1,40 @@
+### v0.10.10 (2017-05-08)
+
+
+### v0.10.9 (2017-04-19)
+
+
+#### Features
+
+* **server:** add local_addr to retrieve resolved address ([71f250ad](https://github.com/hyperium/hyper/commit/71f250ad46e9ae0cac108e1de6dc15289da26a56))
+
+
+### v0.10.8 (2017-04-11)
+
+
+#### Features
+
+* **client:**
+  * introduce PooledStream::<S>::get_ref ([a54ce30f](https://github.com/hyperium/hyper/commit/a54ce30f902772168bbd8dc90f26bb08cecde6ec))
+  * introduce Response::get_ref ([5ef0ec2c](https://github.com/hyperium/hyper/commit/5ef0ec2cd2841e78508a61949a207187be914265))
+
+
+### v0.10.7 (2017-04-08)
+
+
+#### Bug Fixes
+
+* **server:** don't dup the listener TCP socket. ([d2362331](https://github.com/hyperium/hyper/commit/d23623317820696c910ce43262d5276e8e24c066))
+
+
+### v0.10.6 (2017-04-05)
+
+
+#### Features
+
+* **buffer:** add from_parts and into_parts functions ([78551dd0](https://github.com/hyperium/hyper/commit/78551dd040e2ab46e833af355c92fe87aa026244))
+
+
 ### v0.10.5 (2017-03-01)
 
 
