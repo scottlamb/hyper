@@ -8,11 +8,10 @@
 
 use language_tags::LanguageTag;
 use std::fmt;
-use unicase::UniCase;
-use url::percent_encoding;
+use unicase;
 
 use header::{Header, Raw, parsing};
-use header::parsing::{parse_extended_value, HTTP_VALUE};
+use header::parsing::{parse_extended_value, http_percent_encode};
 use header::shared::Charset;
 
 /// The implied disposition of the content of the HTTP body
@@ -103,9 +102,9 @@ impl Header for ContentDisposition {
             };
 
             let mut cd = ContentDisposition {
-                disposition: if UniCase(&*disposition) == UniCase("inline") {
+                disposition: if unicase::eq_ascii(&*disposition, "inline") {
                     DispositionType::Inline
-                } else if UniCase(&*disposition) == UniCase("attachment") {
+                } else if unicase::eq_ascii(&*disposition, "attachment") {
                     DispositionType::Attachment
                 } else {
                     DispositionType::Ext(disposition.to_owned())
@@ -129,11 +128,11 @@ impl Header for ContentDisposition {
                 };
 
                 cd.parameters.push(
-                    if UniCase(&*key) == UniCase("filename") {
+                    if unicase::eq_ascii(&*key, "filename") {
                         DispositionParam::Filename(
                             Charset::Ext("UTF-8".to_owned()), None,
                             val.trim_matches('"').as_bytes().to_owned())
-                    } else if UniCase(&*key) == UniCase("filename*") {
+                    } else if unicase::eq_ascii(&*key, "filename*") {
                         let extended_value = try!(parse_extended_value(val));
                         DispositionParam::Filename(extended_value.charset, extended_value.language_tag, extended_value.value)
                     } else {
@@ -147,8 +146,8 @@ impl Header for ContentDisposition {
     }
 
     #[inline]
-    fn fmt_header(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self, f)
+    fn fmt_header(&self, f: &mut ::header::Formatter) -> fmt::Result {
+        f.fmt_line(self)
     }
 }
 
@@ -165,7 +164,7 @@ impl fmt::Display for ContentDisposition {
                     let mut use_simple_format: bool = false;
                     if opt_lang.is_none() {
                         if let Charset::Ext(ref ext) = *charset {
-                            if UniCase(&**ext) == UniCase("utf-8") {
+                            if unicase::eq_ascii(&**ext, "utf-8") {
                                 use_simple_format = true;
                             }
                         }
@@ -182,8 +181,7 @@ impl fmt::Display for ContentDisposition {
                             try!(write!(f, "{}", lang));
                         };
                         try!(write!(f, "'"));
-                        try!(f.write_str(
-                            &percent_encoding::percent_encode(bytes, HTTP_VALUE).to_string()))
+                        try!(http_percent_encode(f, bytes))
                     }
                 },
                 DispositionParam::Ext(ref k, ref v) => try!(write!(f, "; {}=\"{}\"", k, v)),

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use futures::{Poll, Async, AsyncSink, Stream, Sink, StartSend};
 use futures::task::Task;
-use tokio::io::Io;
+use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_proto::streaming::pipeline::{Frame, Transport};
 
 use header::{ContentLength, TransferEncoding};
@@ -16,7 +16,7 @@ use version::HttpVersion;
 
 
 /// This handles a connection, which will have been established over an
-/// `Io` (like a socket), and will likely include multiple
+/// `AsyncRead + AsyncWrite` (like a socket), and will likely include multiple
 /// `Transaction`s over HTTP.
 ///
 /// The connection will determine when a message begins and ends as well as
@@ -29,7 +29,7 @@ pub struct Conn<I, B, T, K = KA> {
 }
 
 impl<I, B, T, K> Conn<I, B, T, K>
-where I: Io,
+where I: AsyncRead + AsyncWrite,
       B: AsRef<[u8]>,
       T: Http1Transaction,
       K: KeepAlive
@@ -83,10 +83,10 @@ where I: Io,
             Ok(Some(head)) => (head.version, head),
             Ok(None) => return Ok(Async::NotReady),
             Err(e) => {
+                let must_respond_with_error = !self.state.is_idle();
                 self.state.close_read();
                 self.io.consume_leading_lines();
                 let was_mid_parse = !self.io.read_buf().is_empty();
-                let must_respond_with_error = !self.state.is_idle();
                 return if was_mid_parse {
                     debug!("parse error ({}) with bytes: {:?}", e, self.io.read_buf());
                     Ok(Async::Ready(Some(Frame::Error { error: e })))
@@ -155,16 +155,16 @@ where I: Io,
     }
 
     fn maybe_park_read(&mut self) {
-        if self.io.poll_read().is_ready() {
+        if !self.io.is_read_blocked() {
             // the Io object is ready to read, which means it will never alert
             // us that it is ready until we drain it. However, we're currently
             // finished reading, so we need to park the task to be able to
             // wake back up later when more reading should happen.
-            self.state.read_task = Some(::futures::task::park());
+            self.state.read_task = Some(::futures::task::current());
         }
     }
 
-    fn maybe_unpark(&mut self) {
+    fn maybe_notify(&mut self) {
         // its possible that we returned NotReady from poll() without having
         // exhausted the underlying Io. We would have done this when we
         // determined we couldn't keep reading until we knew how writing
@@ -188,13 +188,13 @@ where I: Io,
         }
 
         if let Some(task) = self.state.read_task.take() {
-            task.unpark();
+            task.notify();
         }
     }
 
     fn try_keep_alive(&mut self) {
         self.state.try_keep_alive();
-        self.maybe_unpark();
+        self.maybe_notify();
     }
 
     fn can_write_head(&self) -> bool {
@@ -236,7 +236,7 @@ where I: Io,
         let wants_keep_alive = head.should_keep_alive();
         self.state.keep_alive &= wants_keep_alive;
         let mut buf = Vec::new();
-        let encoder = T::encode(&mut head, &mut buf);
+        let encoder = T::encode(head, &mut buf);
         //TODO: handle when there isn't enough room to buffer the head
         assert!(self.io.buffer(buf) > 0);
         self.state.writing = if body {
@@ -350,7 +350,7 @@ where I: Io,
 }
 
 impl<I, B, T, K> Stream for Conn<I, B, T, K>
-where I: Io,
+where I: AsyncRead + AsyncWrite,
       B: AsRef<[u8]>,
       T: Http1Transaction,
       K: KeepAlive,
@@ -385,7 +385,7 @@ where I: Io,
 }
 
 impl<I, B, T, K> Sink for Conn<I, B, T, K>
-where I: Io,
+where I: AsyncRead + AsyncWrite,
       B: AsRef<[u8]>,
       T: Http1Transaction,
       K: KeepAlive,
@@ -450,10 +450,15 @@ where I: Io,
         trace!("Conn::flush = {:?}", ret);
         ret
     }
+
+    fn close(&mut self) -> Poll<(), Self::SinkError> {
+        try_ready!(self.poll_complete());
+        self.io.io_mut().shutdown()
+    }
 }
 
 impl<I, B, T, K> Transport for Conn<I, B, T, K>
-where I: Io + 'static,
+where I: AsyncRead + AsyncWrite + 'static,
       B: AsRef<[u8]> + 'static,
       T: Http1Transaction + 'static,
       K: KeepAlive + 'static,
@@ -583,9 +588,7 @@ impl<B, K: KeepAlive> State<B, K> {
         match (&self.reading, &self.writing) {
             (&Reading::KeepAlive, &Writing::KeepAlive) => {
                 if let KA::Busy = self.keep_alive.status() {
-                    self.reading = Reading::Init;
-                    self.writing = Writing::Init;
-                    self.keep_alive.idle();
+                    self.idle();
                 } else {
                     self.close();
                 }
@@ -607,7 +610,16 @@ impl<B, K: KeepAlive> State<B, K> {
     }
 
     fn busy(&mut self) {
+        if let KA::Disabled = self.keep_alive.status() {
+            return;
+        }
         self.keep_alive.busy();
+    }
+
+    fn idle(&mut self) {
+        self.reading = Reading::Init;
+        self.writing = Writing::Init;
+        self.keep_alive.idle();
     }
 
     fn is_read_closed(&self) -> bool {
@@ -661,6 +673,7 @@ impl<'a, T: fmt::Debug + 'a, B: AsRef<[u8]> + 'a> fmt::Debug for DebugFrame<'a, 
 #[cfg(test)]
 mod tests {
     use futures::{Async, Future, Stream, Sink};
+    use futures::future;
     use tokio_proto::streaming::pipeline::Frame;
 
     use http::{self, MessageHead, ServerTransaction};
@@ -701,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_conn_parse_partial() {
-        let _: Result<(), ()> = ::futures::lazy(|| {
+        let _: Result<(), ()> = future::lazy(|| {
             let good_message = b"GET / HTTP/1.1\r\nHost: foo.bar\r\n\r\n".to_vec();
             let io = AsyncIo::new_buf(good_message, 10);
             let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
@@ -718,6 +731,42 @@ mod tests {
     }
 
     #[test]
+    fn test_conn_init_read_eof_idle() {
+        let io = AsyncIo::new_buf(vec![], 1);
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+        conn.state.idle();
+
+        match conn.poll().unwrap() {
+            Async::Ready(None) => {},
+            other => panic!("frame is not None: {:?}", other)
+        }
+    }
+
+    #[test]
+    fn test_conn_init_read_eof_idle_partial_parse() {
+        let io = AsyncIo::new_buf(b"GET / HTTP/1.1".to_vec(), 100);
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+        conn.state.idle();
+
+        match conn.poll().unwrap() {
+            Async::Ready(Some(Frame::Error { .. })) => {},
+            other => panic!("frame is not Error: {:?}", other)
+        }
+    }
+
+    #[test]
+    fn test_conn_init_read_eof_busy() {
+        let io = AsyncIo::new_buf(vec![], 1);
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+        conn.state.busy();
+
+        match conn.poll().unwrap() {
+            Async::Ready(Some(Frame::Error { .. })) => {},
+            other => panic!("frame is not Error: {:?}", other)
+        }
+    }
+
+    #[test]
     fn test_conn_closed_read() {
         let io = AsyncIo::new_buf(vec![], 0);
         let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
@@ -731,19 +780,19 @@ mod tests {
 
     #[test]
     fn test_conn_body_write_length() {
-        let _: Result<(), ()> = ::futures::lazy(|| {
+        let _: Result<(), ()> = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 0);
             let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
             let max = ::http::io::MAX_BUFFER_SIZE + 4096;
             conn.state.writing = Writing::Body(Encoder::length((max * 2) as u64), None);
 
-            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'a'; 1024 * 4].into()) }).unwrap().is_ready());
+            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'a'; 1024 * 8].into()) }).unwrap().is_ready());
             assert!(!conn.state.writing.is_queued());
 
             assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'b'; max].into()) }).unwrap().is_ready());
             assert!(conn.state.writing.is_queued());
 
-            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'b'; 1024 * 4].into()) }).unwrap().is_not_ready());
+            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'b'; 1024 * 8].into()) }).unwrap().is_not_ready());
 
             conn.io.io_mut().block_in(1024 * 3);
             assert!(conn.poll_complete().unwrap().is_not_ready());
@@ -752,27 +801,27 @@ mod tests {
             conn.io.io_mut().block_in(max * 2);
             assert!(conn.poll_complete().unwrap().is_ready());
 
-            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'c'; 1024 * 4].into()) }).unwrap().is_ready());
+            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'c'; 1024 * 8].into()) }).unwrap().is_ready());
             Ok(())
         }).wait();
     }
 
     #[test]
     fn test_conn_body_write_chunked() {
-        let _: Result<(), ()> = ::futures::lazy(|| {
+        let _: Result<(), ()> = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 4096);
             let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
             conn.state.writing = Writing::Body(Encoder::chunked(), None);
 
             assert!(conn.start_send(Frame::Body { chunk: Some("headers".into()) }).unwrap().is_ready());
-            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'x'; 4096].into()) }).unwrap().is_ready());
+            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'x'; 8192].into()) }).unwrap().is_ready());
             Ok(())
         }).wait();
     }
 
     #[test]
     fn test_conn_body_flush() {
-        let _: Result<(), ()> = ::futures::lazy(|| {
+        let _: Result<(), ()> = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 1024 * 1024 * 5);
             let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
             conn.state.writing = Writing::Body(Encoder::length(1024 * 1024), None);
@@ -780,6 +829,7 @@ mod tests {
             assert!(conn.state.writing.is_queued());
             assert!(conn.poll_complete().unwrap().is_ready());
             assert!(!conn.state.writing.is_queued());
+            assert!(conn.io.io_mut().flushed());
 
             Ok(())
         }).wait();
@@ -788,25 +838,26 @@ mod tests {
     #[test]
     fn test_conn_parking() {
         use std::sync::Arc;
-        use futures::task::Unpark;
+        use futures::executor::Notify;
+        use futures::executor::NotifyHandle;
 
         struct Car {
             permit: bool,
         }
-        impl Unpark for Car {
-            fn unpark(&self) {
+        impl Notify for Car {
+            fn notify(&self, _id: usize) {
                 assert!(self.permit, "unparked without permit");
             }
         }
 
-        fn car(permit: bool) -> Arc<Unpark> {
+        fn car(permit: bool) -> NotifyHandle {
             Arc::new(Car {
                 permit: permit,
-            })
+            }).into()
         }
 
         // test that once writing is done, unparks
-        let f = ::futures::lazy(|| {
+        let f = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 4096);
             let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
             conn.state.reading = Reading::KeepAlive;
@@ -816,22 +867,22 @@ mod tests {
             assert!(conn.poll_complete().unwrap().is_ready());
             Ok::<(), ()>(())
         });
-        ::futures::executor::spawn(f).poll_future(car(true)).unwrap();
+        ::futures::executor::spawn(f).poll_future_notify(&car(true), 0).unwrap();
 
 
         // test that flushing when not waiting on read doesn't unpark
-        let f = ::futures::lazy(|| {
+        let f = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 4096);
             let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
             conn.state.writing = Writing::KeepAlive;
             assert!(conn.poll_complete().unwrap().is_ready());
             Ok::<(), ()>(())
         });
-        ::futures::executor::spawn(f).poll_future(car(false)).unwrap();
+        ::futures::executor::spawn(f).poll_future_notify(&car(false), 0).unwrap();
 
 
         // test that flushing and writing isn't done doesn't unpark
-        let f = ::futures::lazy(|| {
+        let f = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 4096);
             let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
             conn.state.reading = Reading::KeepAlive;
@@ -840,7 +891,7 @@ mod tests {
             assert!(conn.poll_complete().unwrap().is_ready());
             Ok::<(), ()>(())
         });
-        ::futures::executor::spawn(f).poll_future(car(false)).unwrap();
+        ::futures::executor::spawn(f).poll_future_notify(&car(false), 0).unwrap();
     }
 
     #[test]

@@ -41,7 +41,7 @@
 //!
 //! ```
 //! use std::fmt;
-//! use hyper::header::{Header, Raw};
+//! use hyper::header::{self, Header, Raw};
 //!
 //! #[derive(Debug, Clone, Copy)]
 //! struct Dnt(bool);
@@ -66,28 +66,29 @@
 //!         Err(hyper::Error::Header)
 //!     }
 //!
-//!     fn fmt_header(&self, f: &mut fmt::Formatter) -> fmt::Result {
-//!         if self.0 {
-//!             f.write_str("1")
+//!     fn fmt_header(&self, f: &mut header::Formatter) -> fmt::Result {
+//!         let value = if self.0 {
+//!             "1"
 //!         } else {
-//!             f.write_str("0")
-//!         }
+//!             "0"
+//!         };
+//!         f.fmt_line(&value)
 //!     }
 //! }
 //! ```
-use std::any::{Any, TypeId};
 use std::borrow::{Cow, ToOwned};
 use std::iter::{FromIterator, IntoIterator};
 use std::{mem, fmt};
 
-use unicase::UniCase;
+use unicase::Ascii;
 
 use self::internals::{Item, VecMap, Entry};
+use self::sealed::{GetType, HeaderClone};
 
 pub use self::shared::*;
 pub use self::common::*;
 pub use self::raw::Raw;
-use http::buf::MemSlice;
+use bytes::Bytes;
 
 mod common;
 mod internals;
@@ -100,7 +101,7 @@ pub mod parsing;
 ///
 /// This trait represents the construction and identification of headers,
 /// and contains trait-object unsafe methods.
-pub trait Header: HeaderClone + Any + GetType + Send + Sync {
+pub trait Header: HeaderClone + GetType + Send + Sync {
     /// Returns the name of the header field this belongs to.
     ///
     /// This will become an associated constant once available.
@@ -113,64 +114,92 @@ pub trait Header: HeaderClone + Any + GetType + Send + Sync {
     /// than one field value. If that's the case, you **should** return `None`
     /// if `raw.len() > 1`.
     fn parse_header(raw: &Raw) -> ::Result<Self> where Self: Sized;
-    /// Format a header to be output into a TcpStream.
+    /// Format a header to outgoing stream.
     ///
-    /// This method is not allowed to introduce an Err not produced
-    /// by the passed-in Formatter.
-    fn fmt_header(&self, f: &mut fmt::Formatter) -> fmt::Result;
-    /// Formats a header over multiple lines.
+    /// Most headers should be formatted on one line, and so a common pattern
+    /// would be to implement `std::fmt::Display` for this type as well, and
+    /// then just call `f.fmt_line(self)`.
+    ///
+    /// ## Note
+    ///
+    /// This has the ability to format a header over multiple lines.
     ///
     /// The main example here is `Set-Cookie`, which requires that every
-    /// cookie being set be specified in a separate line.
-    ///
-    /// The API here is still being explored, so this is hidden by default.
-    /// The passed in formatter doesn't have any public methods, so it would
-    /// be quite difficult to depend on this externally.
-    #[doc(hidden)]
+    /// cookie being set be specified in a separate line. Almost every other
+    /// case should only format as 1 single line.
     #[inline]
-    fn fmt_multi_header(&self, f: &mut MultilineFormatter) -> fmt::Result {
-        f.fmt_line(&FmtHeader(self))
+    fn fmt_header(&self, f: &mut Formatter) -> fmt::Result;
+}
+
+mod sealed {
+    use std::any::{Any, TypeId};
+    use super::Header;
+
+    #[doc(hidden)]
+    pub trait GetType: Any {
+        #[inline(always)]
+        fn get_type(&self) -> TypeId {
+            TypeId::of::<Self>()
+        }
+    }
+
+    impl<T: Any> GetType for T {}
+
+    #[doc(hidden)]
+    pub trait HeaderClone {
+        fn clone_box(&self) -> Box<Header + Send + Sync>;
+    }
+
+    impl<T: Header + Clone> HeaderClone for T {
+        #[inline]
+        fn clone_box(&self) -> Box<Header + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn test_get_type() {
+        use ::header::{ContentLength, UserAgent};
+
+        let len = ContentLength(5);
+        let agent = UserAgent::new("hyper");
+
+        assert_eq!(TypeId::of::<ContentLength>(), len.get_type());
+        assert_eq!(TypeId::of::<UserAgent>(), agent.get_type());
+
+        let len: Box<Header + Send + Sync> = Box::new(len);
+        let agent: Box<Header + Send + Sync> = Box::new(agent);
+
+        assert_eq!(TypeId::of::<ContentLength>(), (*len).get_type());
+        assert_eq!(TypeId::of::<UserAgent>(), (*agent).get_type());
     }
 }
 
-#[doc(hidden)]
-pub trait GetType: Any {
-    #[inline(always)]
-    fn get_type(&self) -> TypeId {
-        TypeId::of::<Self>()
-    }
-}
 
-impl<T: Any> GetType for T {}
-
-#[test]
-fn test_get_type() {
-    use ::header::{ContentLength, UserAgent};
-
-    let len = ContentLength(5);
-    let agent = UserAgent("hyper".to_owned());
-
-    assert_eq!(TypeId::of::<ContentLength>(), len.get_type());
-    assert_eq!(TypeId::of::<UserAgent>(), agent.get_type());
-
-    let len: Box<Header + Send + Sync> = Box::new(len);
-    let agent: Box<Header + Send + Sync> = Box::new(agent);
-
-    assert_eq!(TypeId::of::<ContentLength>(), (*len).get_type());
-    assert_eq!(TypeId::of::<UserAgent>(), (*agent).get_type());
-}
-
-#[doc(hidden)]
+/// A formatter used to serialize headers to an output stream.
 #[allow(missing_debug_implementations)]
-pub struct MultilineFormatter<'a, 'b: 'a>(Multi<'a, 'b>);
+pub struct Formatter<'a, 'b: 'a>(Multi<'a, 'b>);
 
 enum Multi<'a, 'b: 'a> {
     Line(&'a str, &'a mut fmt::Formatter<'b>),
     Join(bool, &'a mut fmt::Formatter<'b>),
+    Raw(&'a mut Raw),
 }
 
-impl<'a, 'b> MultilineFormatter<'a, 'b> {
-    fn fmt_line(&mut self, line: &fmt::Display) -> fmt::Result {
+impl<'a, 'b> Formatter<'a, 'b> {
+
+    /// Format one 'line' of a header.
+    ///
+    /// This writes the header name plus the `Display` value as a single line.
+    ///
+    /// ## Note
+    ///
+    /// This has the ability to format a header over multiple lines.
+    ///
+    /// The main example here is `Set-Cookie`, which requires that every
+    /// cookie being set be specified in a separate line. Almost every other
+    /// case should only format as 1 single line.
+    pub fn fmt_line(&mut self, line: &fmt::Display) -> fmt::Result {
         use std::fmt::Write;
         match self.0 {
             Multi::Line(ref name, ref mut f) => {
@@ -187,16 +216,13 @@ impl<'a, 'b> MultilineFormatter<'a, 'b> {
                 }
                 write!(NewlineReplacer(*f), "{}", line)
             }
+            Multi::Raw(ref mut raw) => {
+                let mut s = String::new();
+                try!(write!(NewlineReplacer(&mut s), "{}", line));
+                raw.push(s);
+                Ok(())
+            }
         }
-    }
-}
-
-// Internal helper to wrap fmt_header into a fmt::Display
-struct FmtHeader<'a, H: ?Sized + 'a>(&'a H);
-
-impl<'a, H: Header + ?Sized + 'a> fmt::Display for FmtHeader<'a, H> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.0.fmt_header(f)
     }
 }
 
@@ -205,14 +231,14 @@ struct ValueString<'a>(&'a Item);
 impl<'a> fmt::Debug for ValueString<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         try!(f.write_str("\""));
-        try!(self.0.write_h1(&mut MultilineFormatter(Multi::Join(true, f))));
+        try!(self.0.write_h1(&mut Formatter(Multi::Join(true, f))));
         f.write_str("\"")
     }
 }
 
 impl<'a> fmt::Display for ValueString<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.0.write_h1(&mut MultilineFormatter(Multi::Join(true, f)))
+        self.0.write_h1(&mut Formatter(Multi::Join(true, f)))
     }
 }
 
@@ -222,14 +248,14 @@ impl<'a, H: Header> fmt::Debug for HeaderValueString<'a, H> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         try!(f.write_str("\""));
-        try!(self.0.fmt_multi_header(&mut MultilineFormatter(Multi::Join(true, f))));
+        try!(self.0.fmt_header(&mut Formatter(Multi::Join(true, f))));
         f.write_str("\"")
     }
 }
 
-struct NewlineReplacer<'a, 'b: 'a>(&'a mut fmt::Formatter<'b>);
+struct NewlineReplacer<'a, F: fmt::Write + 'a>(&'a mut F);
 
-impl<'a, 'b> fmt::Write for NewlineReplacer<'a, 'b> {
+impl<'a, F: fmt::Write + 'a> fmt::Write for NewlineReplacer<'a, F> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let mut since = 0;
         for (i, &byte) in s.as_bytes().iter().enumerate() {
@@ -247,17 +273,6 @@ impl<'a, 'b> fmt::Write for NewlineReplacer<'a, 'b> {
     }
 }
 
-#[doc(hidden)]
-pub trait HeaderClone {
-    fn clone_box(&self) -> Box<Header + Send + Sync>;
-}
-
-impl<T: Header + Clone> HeaderClone for T {
-    #[inline]
-    fn clone_box(&self) -> Box<Header + Send + Sync> {
-        Box::new(self.clone())
-    }
-}
 
 impl Header + Send + Sync {
     // A trait object looks like this:
@@ -314,7 +329,7 @@ macro_rules! literals {
             match s.len() {
                 $($len => {
                     $(
-                    if UniCase(<$header>::header_name()) == s {
+                    if Ascii::new(<$header>::header_name()) == Ascii::new(s) {
                         return Cow::Borrowed(<$header>::header_name());
                     }
                     )+
@@ -375,19 +390,19 @@ impl Headers {
     /// The field is determined by the type of the value being set.
     pub fn set<H: Header>(&mut self, value: H) {
         trace!("Headers.set( {:?}, {:?} )", header_name::<H>(), HeaderValueString(&value));
-        self.data.insert(HeaderName(UniCase(Cow::Borrowed(header_name::<H>()))),
+        self.data.insert(HeaderName(Ascii::new(Cow::Borrowed(header_name::<H>()))),
                          Item::new_typed(Box::new(value)));
     }
 
     /// Get a reference to the header field's value, if it exists.
     pub fn get<H: Header>(&self) -> Option<&H> {
-        self.data.get(&HeaderName(UniCase(Cow::Borrowed(header_name::<H>()))))
+        self.data.get(&HeaderName(Ascii::new(Cow::Borrowed(header_name::<H>()))))
         .and_then(Item::typed::<H>)
     }
 
     /// Get a mutable reference to the header field's value, if it exists.
     pub fn get_mut<H: Header>(&mut self) -> Option<&mut H> {
-        self.data.get_mut(&HeaderName(UniCase(Cow::Borrowed(header_name::<H>()))))
+        self.data.get_mut(&HeaderName(Ascii::new(Cow::Borrowed(header_name::<H>()))))
         .and_then(Item::typed_mut::<H>)
     }
 
@@ -403,7 +418,7 @@ impl Headers {
     /// assert!(headers.has::<ContentType>());
     /// ```
     pub fn has<H: Header>(&self) -> bool {
-        self.data.contains_key(&HeaderName(UniCase(Cow::Borrowed(header_name::<H>()))))
+        self.data.contains_key(&HeaderName(Ascii::new(Cow::Borrowed(header_name::<H>()))))
     }
 
     /// Removes a header from the map, if one existed.
@@ -413,7 +428,7 @@ impl Headers {
     /// know whether a header exists, rather rely on `has`.
     pub fn remove<H: Header>(&mut self) -> Option<H> {
         trace!("Headers.remove( {:?} )", header_name::<H>());
-        self.data.remove(&HeaderName(UniCase(Cow::Borrowed(header_name::<H>()))))
+        self.data.remove(&HeaderName(Ascii::new(Cow::Borrowed(header_name::<H>()))))
             .and_then(Item::into_typed::<H>)
     }
 
@@ -449,7 +464,7 @@ impl Headers {
     /// ```
     pub fn get_raw(&self, name: &str) -> Option<&Raw> {
         self.data
-            .get(&HeaderName(UniCase(Cow::Borrowed(unsafe { mem::transmute::<&str, &str>(name) }))))
+            .get(name)
             .map(Item::raw)
     }
 
@@ -469,7 +484,7 @@ impl Headers {
         let name = name.into();
         let value = value.into();
         trace!("Headers.set_raw( {:?}, {:?} )", name, value);
-        self.data.insert(HeaderName(UniCase(name)), Item::new_raw(value));
+        self.data.insert(HeaderName(Ascii::new(name)), Item::new_raw(value));
     }
 
     /// Append a value to raw value of this header.
@@ -491,7 +506,7 @@ impl Headers {
         let name = name.into();
         let value = value.into();
         trace!("Headers.append_raw( {:?}, {:?} )", name, value);
-        let name = HeaderName(UniCase(name));
+        let name = HeaderName(Ascii::new(name));
         if let Some(item) = self.data.get_mut(&name) {
             item.raw_mut().push(value);
             return;
@@ -502,11 +517,8 @@ impl Headers {
     /// Remove a header by name.
     pub fn remove_raw(&mut self, name: &str) {
         trace!("Headers.remove_raw( {:?} )", name);
-        self.data.remove(
-            &HeaderName(UniCase(Cow::Borrowed(unsafe { mem::transmute::<&str, &str>(name) })))
-        );
+        self.data.remove(name);
     }
-
 
 }
 
@@ -564,7 +576,7 @@ impl<'a> HeaderView<'a> {
     /// Check if a HeaderView is a certain Header.
     #[inline]
     pub fn is<H: Header>(&self) -> bool {
-        HeaderName(UniCase(Cow::Borrowed(header_name::<H>()))) == *self.0
+        HeaderName(Ascii::new(Cow::Borrowed(header_name::<H>()))) == *self.0
     }
 
     /// Get the Header name as a slice.
@@ -589,11 +601,17 @@ impl<'a> HeaderView<'a> {
     pub fn value_string(&self) -> String {
         ValueString(self.1).to_string()
     }
+
+    /// Access the raw value of the header.
+    #[inline]
+    pub fn raw(&self) -> &Raw {
+        self.1.raw()
+    }
 }
 
 impl<'a> fmt::Display for HeaderView<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.1.write_h1(&mut MultilineFormatter(Multi::Line(self.0.as_ref(), f)))
+        self.1.write_h1(&mut Formatter(Multi::Line(self.0.as_ref(), f)))
     }
 }
 
@@ -611,10 +629,10 @@ impl<'a> Extend<HeaderView<'a>> for Headers {
     }
 }
 
-impl<'a> Extend<(&'a str, MemSlice)> for Headers {
-    fn extend<I: IntoIterator<Item=(&'a str, MemSlice)>>(&mut self, iter: I) {
+impl<'a> Extend<(&'a str, Bytes)> for Headers {
+    fn extend<I: IntoIterator<Item=(&'a str, Bytes)>>(&mut self, iter: I) {
         for (name, value) in iter {
-            let name = HeaderName(UniCase(maybe_literal(name)));
+            let name = HeaderName(Ascii::new(maybe_literal(name)));
             //let trim = header.value.iter().rev().take_while(|&&x| x == b' ').count();
 
             match self.data.entry(name) {
@@ -637,47 +655,8 @@ impl<'a> FromIterator<HeaderView<'a>> for Headers {
     }
 }
 
-deprecated! {
-    #[deprecated(note="The semantics of formatting a HeaderFormat directly are not clear")]
-    impl<'a> fmt::Display for &'a (Header + Send + Sync) {
-        #[inline]
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            let mut multi = MultilineFormatter(Multi::Join(true, f));
-            self.fmt_multi_header(&mut multi)
-        }
-    }
-}
-
-deprecated! {
-    #[deprecated(note="The semantics of formatting a HeaderFormat directly are not clear")]
-    /// A wrapper around any Header with a Display impl that calls `fmt_header`.
-    ///
-    /// This can be used like so: `format!("{}", HeaderFormatter(&header))` to
-    /// get the 'value string' representation of this Header.
-    ///
-    /// Note: This may not necessarily be the value written to stream, such
-    /// as with the SetCookie header.
-    pub struct HeaderFormatter<'a, H: Header>(pub &'a H);
-}
-
-#[allow(deprecated)]
-impl<'a, H: Header> fmt::Display for HeaderFormatter<'a, H> {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(&HeaderValueString(self.0), f)
-    }
-}
-
-#[allow(deprecated)]
-impl<'a, H: Header> fmt::Debug for HeaderFormatter<'a, H> {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
 #[derive(Clone, Debug)]
-struct HeaderName(UniCase<Cow<'static, str>>);
+struct HeaderName(Ascii<Cow<'static, str>>);
 
 impl fmt::Display for HeaderName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -687,7 +666,7 @@ impl fmt::Display for HeaderName {
 
 impl AsRef<str> for HeaderName {
     fn as_ref(&self) -> &str {
-        ((self.0).0).as_ref()
+        self.0.as_ref()
     }
 }
 
@@ -703,15 +682,21 @@ impl PartialEq for HeaderName {
     }
 }
 
+impl PartialEq<HeaderName> for str {
+    fn eq(&self, other: &HeaderName) -> bool {
+        let k = other.as_ref();
+        if self.len() == k.len() && self.as_ptr() == k.as_ptr() {
+            true
+        } else {
+            other.0 == self
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use std::fmt;
-    use mime::Mime;
-    use mime::TopLevel::Text;
-    use mime::SubLevel::Plain;
-    use super::{Headers, Header, Raw, ContentLength, ContentType,
-                Accept, Host, qitem};
+    use super::{Headers, Header, Raw, ContentLength, ContentType, Host, SetCookie};
 
     #[cfg(feature = "nightly")]
     use test::Bencher;
@@ -734,25 +719,6 @@ mod tests {
         assert_eq!(headers.get(), Some(&ContentLength(10)));
     }
 
-    #[test]
-    fn test_content_type() {
-        let content_type = Header::parse_header(&b"text/plain".as_ref().into());
-        assert_eq!(content_type.ok(), Some(ContentType(Mime(Text, Plain, vec![]))));
-    }
-
-    #[test]
-    fn test_accept() {
-        let text_plain = qitem(Mime(Text, Plain, vec![]));
-        let application_vendor = "application/vnd.github.v3.full+json; q=0.5".parse().unwrap();
-
-        let accept = Header::parse_header(&b"text/plain".as_ref().into());
-        assert_eq!(accept.ok(), Some(Accept(vec![text_plain.clone()])));
-
-        let bytevec = b"application/vnd.github.v3.full+json; q=0.5, text/plain".as_ref().into();
-        let accept = Header::parse_header(&bytevec);
-        assert_eq!(accept.ok(), Some(Accept(vec![application_vendor, text_plain])));
-    }
-
     #[derive(Clone, PartialEq, Debug)]
     struct CrazyLength(Option<bool>, usize);
 
@@ -772,7 +738,13 @@ mod tests {
             }
         }
 
-        fn fmt_header(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fn fmt_header(&self, f: &mut super::Formatter) -> fmt::Result {
+            f.fmt_line(self)
+        }
+    }
+
+    impl fmt::Display for CrazyLength {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             let CrazyLength(ref opt, ref value) = *self;
             write!(f, "{:?}, {:?}", opt, value)
         }
@@ -806,6 +778,19 @@ mod tests {
         headers.set_raw("Content-Type", "text/plain");
         let ContentLength(_) = *headers.get::<ContentLength>().unwrap();
         let ContentType(_) = *headers.get::<ContentType>().unwrap();
+    }
+
+    #[test]
+    fn test_typed_get_raw() {
+        let mut headers = Headers::new();
+        headers.set(ContentLength(15));
+        assert_eq!(headers.get_raw("content-length").unwrap(), "15");
+
+        headers.set(SetCookie(vec![
+            "foo=bar".to_string(),
+            "baz=quux; Path=/path".to_string()
+        ]));
+        assert_eq!(headers.get_raw("set-cookie").unwrap(), &["foo=bar", "baz=quux; Path=/path"][..]);
     }
 
     #[test]
@@ -874,7 +859,7 @@ mod tests {
         let mut headers = Headers::new();
         headers.set(ContentLength(10));
         assert_eq!(headers.len(), 1);
-        headers.set(ContentType(Mime(Text, Plain, vec![])));
+        headers.set(ContentType::json());
         assert_eq!(headers.len(), 2);
         // Redundant, should not increase count.
         headers.set(ContentLength(20));
@@ -885,7 +870,7 @@ mod tests {
     fn test_clear() {
         let mut headers = Headers::new();
         headers.set(ContentLength(10));
-        headers.set(ContentType(Mime(Text, Plain, vec![])));
+        headers.set(ContentType::json());
         assert_eq!(headers.len(), 2);
         headers.clear();
         assert_eq!(headers.len(), 0);
@@ -910,6 +895,17 @@ mod tests {
         for header in headers.iter() {
             assert_eq!(header.name(), "foo");
             assert_eq!(header.value_string(), "one, two");
+        }
+    }
+
+    #[test]
+    fn test_header_view_raw() {
+        let mut headers = Headers::new();
+        headers.set_raw("foo", vec![b"one".to_vec(), b"two".to_vec()]);
+        for header in headers.iter() {
+            assert_eq!(header.name(), "foo");
+            let values: Vec<&[u8]> = header.raw().iter().collect();
+            assert_eq!(values, vec![b"one", b"two"]);
         }
     }
 

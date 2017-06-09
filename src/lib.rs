@@ -14,16 +14,17 @@
 //! [Server](server/index.html), along with a
 //! [typed Headers system](header/index.html).
 
+extern crate bytes;
 #[macro_use] extern crate futures;
 extern crate futures_cpupool;
 extern crate httparse;
-#[cfg_attr(test, macro_use)] extern crate language_tags;
+extern crate language_tags;
 #[macro_use] extern crate log;
-#[macro_use] pub extern crate mime;
-extern crate relay;
+pub extern crate mime;
 extern crate base64;
 extern crate time;
-#[macro_use] extern crate tokio_core as tokio;
+extern crate tokio_core as tokio;
+#[macro_use] extern crate tokio_io;
 extern crate tokio_proto;
 extern crate tokio_service;
 extern crate unicase;
@@ -34,34 +35,16 @@ extern crate test;
 
 
 pub use uri::Uri;
-pub use url::Url;
 pub use client::Client;
 pub use error::{Result, Error};
 pub use header::Headers;
 pub use http::{Body, Chunk};
+pub use http::request::Request;
+pub use http::response::Response;
 pub use method::Method::{self, Get, Head, Post, Put, Delete};
 pub use status::StatusCode::{self, Ok, BadRequest, NotFound};
 pub use server::Server;
 pub use version::HttpVersion;
-
-macro_rules! unimplemented {
-    () => ({
-        panic!("unimplemented")
-    });
-    ($msg:expr) => ({
-        unimplemented!("{}", $msg)
-    });
-    ($fmt:expr, $($arg:tt)*) => ({
-        panic!(concat!("unimplemented: ", $fmt), $($arg)*)
-    });
-}
-
-macro_rules! deprecated {
-    (#[$note:meta] $i:item) => (
-        #[cfg_attr(has_deprecated, $note)]
-        $i
-    );
-}
 
 #[cfg(test)]
 mod mock;

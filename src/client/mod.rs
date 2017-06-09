@@ -1,7 +1,4 @@
 //! HTTP Client
-//!
-//! The HTTP `Client` uses asynchronous IO, and utilizes the `Handler` trait
-//! to convey when IO events are available for a given request.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -10,9 +7,9 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::time::Duration;
 
-use futures::{Poll, Async, Future, Stream};
-use relay;
-use tokio::io::Io;
+use futures::{future, Poll, Async, Future, Stream};
+use futures::unsync::oneshot;
+use tokio_io::{AsyncRead, AsyncWrite};
 use tokio::reactor::Handle;
 use tokio_proto::BindClient;
 use tokio_proto::streaming::Message;
@@ -22,19 +19,19 @@ pub use tokio_service::Service;
 
 use header::{Headers, Host};
 use http::{self, TokioBody};
+use http::response;
+use http::request;
 use method::Method;
 use self::pool::{Pool, Pooled};
-use Url;
+use uri::{self, Uri};
 
+pub use http::response::Response;
+pub use http::request::Request;
 pub use self::connect::{HttpConnector, Connect};
-pub use self::request::Request;
-pub use self::response::Response;
 
 mod connect;
 mod dns;
 mod pool;
-mod request;
-mod response;
 
 /// A Client to make outgoing HTTP requests.
 // If the Connector is clone, then the Client can be clone easily.
@@ -77,6 +74,12 @@ impl Client<HttpConnector, http::Body> {
 }
 
 impl<C, B> Client<C, B> {
+    /// Return a reference to a handle to the event loop this Client is associated with.
+    #[inline]
+    pub fn handle<'a>(&'a self) -> &'a Handle {
+        &self.handle
+    }
+
     /// Create a new client with a specific connector.
     #[inline]
     fn configured(config: Config<C, B>, handle: &Handle) -> Client<C, B> {
@@ -95,7 +98,7 @@ where C: Connect,
 {
     /// Send a GET Request using this Client.
     #[inline]
-    pub fn get(&self, url: Url) -> FutureResponse {
+    pub fn get(&self, url: Uri) -> FutureResponse {
         self.request(Request::new(Method::Get, url))
     }
 
@@ -135,26 +138,38 @@ where C: Connect,
     type Future = FutureResponse;
 
     fn call(&self, req: Self::Request) -> Self::Future {
-        let url = req.url().clone();
+        let url = req.uri().clone();
+        let domain = match uri::scheme_and_authority(&url) {
+            Some(uri) => uri,
+            None => {
+                return FutureResponse(Box::new(future::err(::Error::Io(
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid URI for Client Request"
+                    )
+                ))));
+            }
+        };
+        let host = Host::new(domain.host().expect("authority implies host").to_owned(), domain.port());
         let (mut head, body) = request::split(req);
         let mut headers = Headers::new();
-        headers.set(Host::new(url.host_str().unwrap().to_owned(), url.port()));
+        headers.set(host);
         headers.extend(head.headers.iter());
         head.headers = headers;
 
-        let checkout = self.pool.checkout(&url[..::url::Position::BeforePath]);
+        let checkout = self.pool.checkout(domain.as_ref());
         let connect = {
             let handle = self.handle.clone();
             let pool = self.pool.clone();
-            let pool_key = Rc::new(url[..::url::Position::BeforePath].to_owned());
+            let pool_key = Rc::new(domain.to_string());
             self.connector.connect(url)
                 .map(move |io| {
-                    let (tx, rx) = relay::channel();
+                    let (tx, rx) = oneshot::channel();
                     let client = HttpClient {
                         client_rx: RefCell::new(Some(rx)),
                     }.bind_client(&handle, io);
                     let pooled = pool.pooled(pool_key, client);
-                    tx.complete(pooled.clone());
+                    drop(tx.send(pooled.clone()));
                     pooled
                 })
         };
@@ -180,8 +195,8 @@ where C: Connect,
         });
         FutureResponse(Box::new(req.map(|msg| {
             match msg {
-                Message::WithoutBody(head) => response::new(head, None),
-                Message::WithBody(head, body) => response::new(head, Some(body.into())),
+                Message::WithoutBody(head) => response::from_wire(head, None),
+                Message::WithBody(head, body) => response::from_wire(head, Some(body.into())),
             }
         })))
     }
@@ -207,11 +222,11 @@ impl<C, B> fmt::Debug for Client<C, B> {
 type TokioClient<B> = ClientProxy<Message<http::RequestHead, B>, Message<http::ResponseHead, TokioBody>, ::Error>;
 
 struct HttpClient<B> {
-    client_rx: RefCell<Option<relay::Receiver<Pooled<TokioClient<B>>>>>,
+    client_rx: RefCell<Option<oneshot::Receiver<Pooled<TokioClient<B>>>>>,
 }
 
 impl<T, B> ClientProto<T> for HttpClient<B>
-where T: Io + 'static,
+where T: AsyncRead + AsyncWrite + 'static,
       B: Stream<Error=::Error> + 'static,
       B::Item: AsRef<[u8]>,
 {
@@ -232,12 +247,12 @@ where T: Io + 'static,
 }
 
 struct BindingClient<T, B> {
-    rx: relay::Receiver<Pooled<TokioClient<B>>>,
+    rx: oneshot::Receiver<Pooled<TokioClient<B>>>,
     io: Option<T>,
 }
 
 impl<T, B> Future for BindingClient<T, B>
-where T: Io + 'static,
+where T: AsyncRead + AsyncWrite + 'static,
       B: Stream<Error=::Error>,
       B::Item: AsRef<[u8]>,
 {
@@ -307,7 +322,7 @@ impl<C, B> Config<C, B> {
 
     /// Set the `Connect` type to be used.
     #[inline]
-    pub fn connector<CC: Connect>(self, val: CC) -> Config<CC, B> {
+    pub fn connector<CC>(self, val: CC) -> Config<CC, B> {
         Config {
             _body_type: self._body_type,
             //connect_timeout: self.connect_timeout,

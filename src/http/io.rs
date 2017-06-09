@@ -1,20 +1,20 @@
 use std::cmp;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::ptr;
 
-use futures::Async;
-use tokio::io::Io;
+use tokio_io::{AsyncRead, AsyncWrite};
 
-use http::{Http1Transaction, h1, MessageHead, ParseResult, DebugTruncate};
-use http::buf::{MemBuf, MemSlice};
+use http::{Http1Transaction, MessageHead, DebugTruncate};
+use bytes::{BytesMut, Bytes};
 
-const INIT_BUFFER_SIZE: usize = 4096;
+const INIT_BUFFER_SIZE: usize = 8192;
 pub const MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 
 pub struct Buffered<T> {
     io: T,
-    read_buf: MemBuf,
+    read_blocked: bool,
+    read_buf: BytesMut,
     write_buf: WriteBuf,
 }
 
@@ -27,80 +27,103 @@ impl<T> fmt::Debug for Buffered<T> {
     }
 }
 
-impl<T: Io> Buffered<T> {
+impl<T: AsyncRead + AsyncWrite> Buffered<T> {
     pub fn new(io: T) -> Buffered<T> {
         Buffered {
             io: io,
-            read_buf: MemBuf::new(),
+            read_buf: BytesMut::with_capacity(0),
             write_buf: WriteBuf::new(),
+            read_blocked: false,
         }
     }
 
     pub fn read_buf(&self) -> &[u8] {
-        self.read_buf.bytes()
+        self.read_buf.as_ref()
     }
 
     pub fn consume_leading_lines(&mut self) {
         if !self.read_buf.is_empty() {
             let mut i = 0;
             while i < self.read_buf.len() {
-                match self.read_buf.bytes()[i] {
+                match self.read_buf[i] {
                     b'\r' | b'\n' => i += 1,
                     _ => break,
                 }
             }
-            self.read_buf.slice(i);
+            self.read_buf.split_to(i);
         }
-    }
-
-    pub fn poll_read(&mut self) -> Async<()> {
-        self.io.poll_read()
     }
 
     pub fn parse<S: Http1Transaction>(&mut self) -> ::Result<Option<MessageHead<S::Incoming>>> {
-        self.reserve_read_buf();
-        match self.read_buf.read_from(&mut self.io) {
-            Ok(0) => {
-                trace!("parse eof");
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "parse eof").into());
+        loop {
+            match try!(S::parse(&mut self.read_buf)) {
+                Some(head) => {
+                    //trace!("parsed {} bytes out of {}", len, self.read_buf.len());
+                    return Ok(Some(head.0))
+                },
+                None => {
+                    if self.read_buf.capacity() >= MAX_BUFFER_SIZE {
+                        debug!("MAX_BUFFER_SIZE reached, closing");
+                        return Err(::Error::TooLarge);
+                    }
+                },
             }
-            Ok(_) => {},
-            Err(e) => match e.kind() {
-                io::ErrorKind::WouldBlock => {},
-                _ => return Err(e.into())
-            }
-        }
-        match try!(parse::<S, _>(&self.read_buf)) {
-            Some(head) => {
-                //trace!("parsed {} bytes out of {}", len, self.read_buf.len());
-                //self.read_buf.slice(len);
-                Ok(Some(head.0))
-            },
-            None => {
-                if self.read_buf.capacity() >= MAX_BUFFER_SIZE {
-                    debug!("MAX_BUFFER_SIZE reached, closing");
-                    Err(::Error::TooLarge)
-                } else {
-                    Ok(None)
+            match self.read_from_io() {
+                Ok(0) => {
+                    trace!("parse eof");
+                    //TODO: With Rust 1.14, this can be Error::from(ErrorKind)
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, ParseEof).into());
                 }
-            },
+                Ok(_) => {},
+                Err(e) => match e.kind() {
+                    io::ErrorKind::WouldBlock => {
+                        return Ok(None);
+                    },
+                    _ => return Err(e.into())
+                }
+            }
         }
     }
 
-    fn reserve_read_buf(&mut self) {
-        self.read_buf.reserve(INIT_BUFFER_SIZE);
+    fn read_from_io(&mut self) -> io::Result<usize> {
+        use bytes::BufMut;
+        // TODO: Investigate if we still need these unsafe blocks
+        if self.read_buf.remaining_mut() < INIT_BUFFER_SIZE {
+            self.read_buf.reserve(INIT_BUFFER_SIZE);
+            unsafe { // Zero out unused memory
+                let buf = self.read_buf.bytes_mut();
+                let len = buf.len();
+                ptr::write_bytes(buf.as_mut_ptr(), 0, len);
+            }
+        }
+        self.read_blocked = false;
+        unsafe { // Can we use AsyncRead::read_buf instead?
+            let n = match self.io.read(self.read_buf.bytes_mut()) {
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        self.read_blocked = true;
+                    }
+                    return Err(e)
+                }
+            };
+            self.read_buf.advance_mut(n);
+            Ok(n)
+        }
     }
 
     pub fn buffer<B: AsRef<[u8]>>(&mut self, buf: B) -> usize {
         self.write_buf.buffer(buf.as_ref())
     }
 
-    #[cfg(test)]
     pub fn io_mut(&mut self) -> &mut T {
         &mut self.io
     }
-}
 
+    pub fn is_read_blocked(&self) -> bool {
+        self.read_blocked
+    }
+}
 
 impl<T: Write> Write for Buffered<T> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -109,38 +132,34 @@ impl<T: Write> Write for Buffered<T> {
 
     fn flush(&mut self) -> io::Result<()> {
         if self.write_buf.remaining() == 0 {
-            Ok(())
+            self.io.flush()
         } else {
             loop {
                 let n = try!(self.write_buf.write_into(&mut self.io));
                 debug!("flushed {} bytes", n);
                 if self.write_buf.remaining() == 0 {
-                    return Ok(())
+                    break;
                 }
             }
+            self.io.flush()
         }
     }
 }
 
-fn parse<T: Http1Transaction<Incoming=I>, I>(rdr: &MemBuf) -> ParseResult<I> {
-    h1::parse::<T, I>(rdr)
-}
-
 pub trait MemRead {
-    fn read_mem(&mut self, len: usize) -> io::Result<MemSlice>;
+    fn read_mem(&mut self, len: usize) -> io::Result<Bytes>;
 }
 
-impl<T: Read> MemRead for Buffered<T> {
-    fn read_mem(&mut self, len: usize) -> io::Result<MemSlice> {
+impl<T: AsyncRead + AsyncWrite> MemRead for Buffered<T> {
+    fn read_mem(&mut self, len: usize) -> io::Result<Bytes> {
         trace!("Buffered.read_mem read_buf={}, wanted={}", self.read_buf.len(), len);
         if !self.read_buf.is_empty() {
             let n = ::std::cmp::min(len, self.read_buf.len());
             trace!("Buffered.read_mem read_buf is not empty, slicing {}", n);
-            Ok(self.read_buf.slice(n))
+            Ok(self.read_buf.split_to(n).freeze())
         } else {
-            self.read_buf.reset();
-            let n = try!(self.read_buf.read_from(&mut self.io));
-            Ok(self.read_buf.slice(::std::cmp::min(len, n)))
+            let n = try!(self.read_from_io());
+            Ok(self.read_buf.split_to(::std::cmp::min(len, n)).freeze())
         }
     }
 }
@@ -288,6 +307,33 @@ impl WriteBuf {
     }
 }
 
+#[derive(Debug)]
+struct ParseEof;
+
+impl fmt::Display for ParseEof {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("parse eof")
+    }
+}
+
+impl ::std::error::Error for ParseEof {
+    fn description(&self) -> &str {
+        "parse eof"
+    }
+}
+
+#[cfg(test)]
+use std::io::Read;
+
+#[cfg(test)]
+impl<T: Read> MemRead for ::mock::AsyncIo<T> {
+    fn read_mem(&mut self, len: usize) -> io::Result<Bytes> {
+        let mut v = vec![0; len];
+        let n = try!(self.read(v.as_mut_slice()));
+        Ok(BytesMut::from(&v[..n]).freeze())
+    }
+}
+
 #[test]
 fn test_iobuf_write_empty_slice() {
     use mock::{AsyncIo, Buf as MockBuf};
@@ -301,4 +347,16 @@ fn test_iobuf_write_empty_slice() {
     // so we are testing that the io_buf does not trigger a write
     // when there is nothing to flush
     io_buf.flush().expect("should short-circuit flush");
+}
+
+#[test]
+fn test_parse_reads_until_blocked() {
+    use mock::{AsyncIo, Buf as MockBuf};
+    // missing last line ending
+    let raw = "HTTP/1.1 200 OK\r\n";
+
+    let mock = AsyncIo::new(MockBuf::wrap(raw.into()), raw.len());
+    let mut buffered = Buffered::new(mock);
+    assert_eq!(buffered.parse::<super::ClientTransaction>().unwrap(), None);
+    assert!(buffered.io.blocked());
 }

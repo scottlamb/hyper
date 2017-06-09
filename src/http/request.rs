@@ -1,43 +1,45 @@
 use std::fmt;
 
-use Url;
-
 use header::Headers;
-use http::{Body, RequestHead};
+use http::{Body, MessageHead, RequestHead, RequestLine};
 use method::Method;
-use uri::Uri;
+use uri::{self, Uri};
 use version::HttpVersion;
-use std::str::FromStr;
+use std::net::SocketAddr;
 
 /// A client request to a remote server.
 pub struct Request<B = Body> {
     method: Method,
-    url: Url,
+    uri: Uri,
     version: HttpVersion,
     headers: Headers,
     body: Option<B>,
+    is_proxy: bool,
+    remote_addr: Option<SocketAddr>,
 }
 
 impl<B> Request<B> {
     /// Construct a new Request.
     #[inline]
-    pub fn new(method: Method, url: Url) -> Request<B> {
+    pub fn new(method: Method, uri: Uri) -> Request<B> {
         Request {
             method: method,
-            url: url,
+            uri: uri,
             version: HttpVersion::default(),
             headers: Headers::new(),
             body: None,
+            is_proxy: false,
+            remote_addr: None,
         }
     }
 
-    /// Read the Request Url.
+    /// Read the Request Uri.
     #[inline]
-    pub fn url(&self) -> &Url { &self.url }
+    pub fn uri(&self) -> &Uri { &self.uri }
 
     /// Read the Request Version.
     #[inline]
-    pub fn version(&self) -> &HttpVersion { &self.version }
+    pub fn version(&self) -> HttpVersion { self.version }
 
     /// Read the Request headers.
     #[inline]
@@ -47,6 +49,31 @@ impl<B> Request<B> {
     #[inline]
     pub fn method(&self) -> &Method { &self.method }
 
+    /// Read the Request body.
+    #[inline]
+    pub fn body_ref(&self) -> Option<&B> { self.body.as_ref() }
+
+    /// The remote socket address of this request
+    ///
+    /// This is an `Option`, because some underlying transports may not have
+    /// a socket address, such as Unix Sockets.
+    ///
+    /// This field is not used for outgoing requests.
+    #[inline]
+    pub fn remote_addr(&self) -> Option<SocketAddr> { self.remote_addr }
+
+    /// The target path of this Request.
+    #[inline]
+    pub fn path(&self) -> &str {
+        self.uri.path()
+    }
+
+    /// The query string of this Request.
+    #[inline]
+    pub fn query(&self) -> Option<&str> {
+        self.uri.query()
+    }
+
     /// Set the Method of this request.
     #[inline]
     pub fn set_method(&mut self, method: Method) { self.method = method; }
@@ -55,9 +82,9 @@ impl<B> Request<B> {
     #[inline]
     pub fn headers_mut(&mut self) -> &mut Headers { &mut self.headers }
 
-    /// Set the `Url` of this request.
+    /// Set the `Uri` of this request.
     #[inline]
-    pub fn set_url(&mut self, url: Url) { self.url = url; }
+    pub fn set_uri(&mut self, uri: Uri) { self.uri = uri; }
 
     /// Set the `HttpVersion` of this request.
     #[inline]
@@ -66,21 +93,75 @@ impl<B> Request<B> {
     /// Set the body of the request.
     #[inline]
     pub fn set_body<T: Into<B>>(&mut self, body: T) { self.body = Some(body.into()); }
+
+    /// Set that the URI should use the absolute form.
+    ///
+    /// This is only needed when talking to HTTP/1 proxies to URLs not
+    /// protected by TLS.
+    #[inline]
+    pub fn set_proxy(&mut self, is_proxy: bool) { self.is_proxy = is_proxy; }
+}
+
+impl Request<Body> {
+    /// Deconstruct this Request into its pieces.
+    ///
+    /// Modifying these pieces will have no effect on how hyper behaves.
+    #[inline]
+    pub fn deconstruct(self) -> (Method, Uri, HttpVersion, Headers, Body) {
+        (self.method, self.uri, self.version, self.headers, self.body.unwrap_or_default())
+    }
+
+    /// Take the Request body.
+    #[inline]
+    pub fn body(self) -> Body { self.body.unwrap_or_default() }
 }
 
 impl<B> fmt::Debug for Request<B> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Request")
             .field("method", &self.method)
-            .field("url", &self.url)
+            .field("uri", &self.uri)
             .field("version", &self.version)
+            .field("remote_addr", &self.remote_addr)
             .field("headers", &self.headers)
             .finish()
     }
 }
 
+struct MaybeAddr<'a>(&'a Option<SocketAddr>);
+
+impl<'a> fmt::Display for MaybeAddr<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self.0 {
+            Some(ref addr) => fmt::Display::fmt(addr, f),
+            None => f.write_str("None"),
+        }
+    }
+}
+
+/// Constructs a request using a received ResponseHead and optional body
+pub fn from_wire<B>(addr: Option<SocketAddr>, incoming: RequestHead, body: B) -> Request<B> {
+    let MessageHead { version, subject: RequestLine(method, uri), headers } = incoming;
+    debug!("Request::new: addr={}, req=\"{} {} {}\"", MaybeAddr(&addr), method, uri, version);
+    debug!("Request::new: headers={:?}", headers);
+
+    Request::<B> {
+        method: method,
+        uri: uri,
+        headers: headers,
+        version: version,
+        remote_addr: addr,
+        body: Some(body),
+        is_proxy: false,
+    }
+}
+
 pub fn split<B>(req: Request<B>) -> (RequestHead, Option<B>) {
-    let uri = Uri::from_str(&req.url[::url::Position::BeforePath..::url::Position::AfterQuery]).expect("url is uri");
+    let uri = if req.is_proxy {
+        req.uri
+    } else {
+        uri::origin_form(&req.uri)
+    };
     let head = RequestHead {
         subject: ::http::RequestLine(req.method, uri),
         headers: req.headers,

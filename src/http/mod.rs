@@ -2,6 +2,8 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use bytes::BytesMut;
+
 use header::{Connection, ConnectionOption};
 use header::Headers;
 use method::Method;
@@ -13,16 +15,17 @@ use version::HttpVersion::{Http10, Http11};
 pub use self::conn::{Conn, KeepAlive, KA};
 pub use self::body::{Body, TokioBody};
 pub use self::chunk::Chunk;
-use self::buf::MemBuf;
+pub use self::str::ByteStr;
 
 mod body;
-#[doc(hidden)]
-pub mod buf;
 mod chunk;
 mod conn;
 mod io;
 mod h1;
 //mod h2;
+mod str;
+pub mod request;
+pub mod response;
 
 /*
 macro_rules! nonblocking {
@@ -39,7 +42,7 @@ macro_rules! nonblocking {
 */
 
 /// An Incoming Message head. Includes request/status line, and headers.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MessageHead<S> {
     /// HTTP version of the message.
     pub version: HttpVersion,
@@ -70,9 +73,25 @@ impl<S> MessageHead<S> {
     }
 }
 
+impl ResponseHead {
+    /// Converts this head's RawStatus into a StatusCode.
+    #[inline]
+    pub fn status(&self) -> StatusCode {
+        self.subject.status()
+    }
+}
+
 /// The raw status code and reason-phrase.
 #[derive(Clone, PartialEq, Debug)]
 pub struct RawStatus(pub u16, pub Cow<'static, str>);
+
+impl RawStatus {
+    /// Converts this into a StatusCode.
+    #[inline]
+    pub fn status(&self) -> StatusCode {
+        StatusCode::from_u16(self.0)
+    }
+}
 
 impl fmt::Display for RawStatus {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -124,14 +143,13 @@ pub enum ClientTransaction {}
 pub trait Http1Transaction {
     type Incoming;
     type Outgoing: Default;
-    //type KeepAlive: KeepAlive;
-    fn parse(bytes: &MemBuf) -> ParseResult<Self::Incoming>;
+    fn parse(bytes: &mut BytesMut) -> ParseResult<Self::Incoming>;
     fn decoder(head: &MessageHead<Self::Incoming>) -> ::Result<h1::Decoder>;
-    fn encode(head: &mut MessageHead<Self::Outgoing>, dst: &mut Vec<u8>) -> h1::Encoder;
+    fn encode(head: MessageHead<Self::Outgoing>, dst: &mut Vec<u8>) -> h1::Encoder;
     fn should_set_length(head: &MessageHead<Self::Outgoing>) -> bool;
 }
 
-type ParseResult<T> = ::Result<Option<(MessageHead<T>, usize)>>;
+pub type ParseResult<T> = ::Result<Option<(MessageHead<T>, usize)>>;
 
 struct DebugTruncate<'a>(&'a [u8]);
 

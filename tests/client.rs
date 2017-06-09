@@ -37,6 +37,7 @@ macro_rules! test {
                 url: $client_url:expr,
                 headers: [ $($request_headers:expr,)* ],
                 body: $request_body:expr,
+                proxy: $request_proxy:expr,
 
             response:
                 status: $client_status:ident,
@@ -61,6 +62,8 @@ macro_rules! test {
                 let body: &'static str = body;
                 req.set_body(body);
             }
+            req.set_proxy($request_proxy);
+
             let res = client.request(req);
 
             let (tx, rx) = oneshot::channel();
@@ -75,10 +78,10 @@ macro_rules! test {
                 while n < buf.len() && n < expected.len() {
                     n += inc.read(&mut buf[n..]).unwrap();
                 }
-                assert_eq!(s(&buf[..n]), expected, "expected is invalid");
+                assert_eq!(s(&buf[..n]), expected);
 
                 inc.write_all($server_reply.as_ref()).unwrap();
-                tx.complete(());
+                let _ = tx.send(());
             });
 
             let rx = rx.map_err(|_| hyper::Error::Io(io::Error::new(io::ErrorKind::Other, "thread panicked")));
@@ -86,9 +89,9 @@ macro_rules! test {
             let work = res.join(rx).map(|r| r.0);
 
             let res = core.run(work).unwrap();
-            assert_eq!(res.status(), &StatusCode::$client_status, "status is invalid");
+            assert_eq!(res.status(), StatusCode::$client_status);
             $(
-                assert_eq!(res.headers().get(), Some(&$response_headers), "headers are invalid");
+                assert_eq!(res.headers().get(), Some(&$response_headers));
             )*
         }
     );
@@ -109,6 +112,7 @@ test! {
             url: "http://{addr}/",
             headers: [],
             body: None,
+            proxy: false,
         response:
             status: Ok,
             headers: [
@@ -130,6 +134,7 @@ test! {
             url: "http://{addr}/foo?key=val#dont_send_me",
             headers: [],
             body: None,
+            proxy: false,
         response:
             status: Ok,
             headers: [
@@ -159,6 +164,7 @@ test! {
                 ContentLength(7),
             ],
             body: Some("foo bar"),
+            proxy: false,
         response:
             status: Ok,
             headers: [],
@@ -188,6 +194,31 @@ test! {
                 TransferEncoding::chunked(),
             ],
             body: Some("foo bar baz"),
+            proxy: false,
+        response:
+            status: Ok,
+            headers: [],
+            body: None,
+}
+
+test! {
+    name: client_http_proxy,
+
+    server:
+        expected: "\
+            GET http://{addr}/proxy HTTP/1.1\r\n\
+            Host: {addr}\r\n\
+            \r\n\
+            ",
+        reply: REPLY_OK,
+
+    client:
+        request:
+            method: Get,
+            url: "http://{addr}/proxy",
+            headers: [],
+            body: None,
+            proxy: true,
         response:
             status: Ok,
             headers: [],
@@ -211,13 +242,13 @@ fn client_keep_alive() {
         let mut buf = [0; 4096];
         sock.read(&mut buf).expect("read 1");
         sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").expect("write 1");
-        tx1.complete(());
+        let _ = tx1.send(());
 
         sock.read(&mut buf).expect("read 2");
         let second_get = b"GET /b HTTP/1.1\r\n";
         assert_eq!(&buf[..second_get.len()], second_get);
         sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").expect("write 2");
-        tx2.complete(());
+        let _ = tx2.send(());
     });
 
 
@@ -254,7 +285,7 @@ fn client_pooled_socket_disconnected() {
         let out = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", remote_addr.len(), remote_addr);
         sock.write_all(out.as_bytes()).expect("write 1");
         drop(sock);
-        tx1.complete(());
+        tx1.send(());
 
         let mut sock = server.accept().unwrap().0;
         sock.read(&mut buf).expect("read 2");
@@ -263,7 +294,7 @@ fn client_pooled_socket_disconnected() {
         let remote_addr = sock.peer_addr().unwrap().to_string();
         let out = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", remote_addr.len(), remote_addr);
         sock.write_all(out.as_bytes()).expect("write 2");
-        tx2.complete(());
+        tx2.send(());
     });
 
     // spin shortly so we receive the hangup on the client socket

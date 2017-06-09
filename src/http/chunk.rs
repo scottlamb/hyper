@@ -1,27 +1,26 @@
 use std::fmt;
+//use std::mem;
 
-use http::buf::MemSlice;
+use bytes::Bytes;
 
 /// A piece of a message body.
 pub struct Chunk(Inner);
 
 enum Inner {
-    Owned(Vec<u8>),
-    Mem(MemSlice),
-    Static(&'static [u8]),
+    Shared(Bytes),
 }
 
 impl From<Vec<u8>> for Chunk {
     #[inline]
     fn from(v: Vec<u8>) -> Chunk {
-        Chunk(Inner::Owned(v))
+        Chunk::from(Bytes::from(v))
     }
 }
 
 impl From<&'static [u8]> for Chunk {
     #[inline]
     fn from(slice: &'static [u8]) -> Chunk {
-        Chunk(Inner::Static(slice))
+        Chunk::from(Bytes::from_static(slice))
     }
 }
 
@@ -39,9 +38,19 @@ impl From<&'static str> for Chunk {
     }
 }
 
-impl From<MemSlice> for Chunk {
-    fn from(mem: MemSlice) -> Chunk {
-        Chunk(Inner::Mem(mem))
+impl From<Bytes> for Chunk {
+    #[inline]
+    fn from(mem: Bytes) -> Chunk {
+        Chunk(Inner::Shared(mem))
+    }
+}
+
+impl From<Chunk> for Bytes {
+    #[inline]
+    fn from(chunk: Chunk) -> Bytes {
+        match chunk.0 {
+            Inner::Shared(bytes) => bytes,
+        }
     }
 }
 
@@ -58,9 +67,7 @@ impl AsRef<[u8]> for Chunk {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         match self.0 {
-            Inner::Owned(ref vec) => vec,
-            Inner::Mem(ref slice) => slice.as_ref(),
-            Inner::Static(slice) => slice,
+            Inner::Shared(ref slice) => slice,
         }
     }
 }
@@ -69,5 +76,33 @@ impl fmt::Debug for Chunk {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self.as_ref(), f)
+    }
+}
+
+impl Default for Chunk {
+    #[inline]
+    fn default() -> Chunk {
+        Chunk(Inner::Shared(Bytes::new()))
+    }
+}
+
+impl IntoIterator for Chunk {
+    type Item = u8;
+    type IntoIter = <Bytes as IntoIterator>::IntoIter;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        match self.0 {
+            Inner::Shared(bytes) => bytes.into_iter(),
+        }
+    }
+}
+
+impl Extend<u8> for Chunk {
+    #[inline]
+    fn extend<T>(&mut self, iter: T) where T: IntoIterator<Item=u8> {
+        match self.0 {
+            Inner::Shared(ref mut bytes) => bytes.extend(iter)
+        }
     }
 }

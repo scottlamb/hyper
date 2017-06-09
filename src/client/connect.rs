@@ -1,13 +1,15 @@
+use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+use std::mem;
 //use std::net::SocketAddr;
 
 use futures::{Future, Poll, Async};
-use tokio::io::Io;
+use tokio_io::{AsyncRead, AsyncWrite};
 use tokio::reactor::Handle;
 use tokio::net::{TcpStream, TcpStreamNew};
 use tokio_service::Service;
-use Url;
+use Uri;
 
 use super::dns;
 
@@ -15,25 +17,25 @@ use super::dns;
 ///
 /// This trait is not implemented directly, and only exists to make
 /// the intent clearer. A connector should implement `Service` with
-/// `Request=Url` and `Response: Io` instead.
-pub trait Connect: Service<Request=Url, Error=io::Error> + 'static {
+/// `Request=Uri` and `Response: Io` instead.
+pub trait Connect: Service<Request=Uri, Error=io::Error> + 'static {
     /// The connected Io Stream.
-    type Output: Io + 'static;
+    type Output: AsyncRead + AsyncWrite + 'static;
     /// A Future that will resolve to the connected Stream.
     type Future: Future<Item=Self::Output, Error=io::Error> + 'static;
     /// Connect to a remote address.
-    fn connect(&self, Url) -> <Self as Connect>::Future;
+    fn connect(&self, Uri) -> <Self as Connect>::Future;
 }
 
 impl<T> Connect for T
-where T: Service<Request=Url, Error=io::Error> + 'static,
-      T::Response: Io,
+where T: Service<Request=Uri, Error=io::Error> + 'static,
+      T::Response: AsyncRead + AsyncWrite,
       T::Future: Future<Error=io::Error>,
 {
     type Output = T::Response;
     type Future = T::Future;
 
-    fn connect(&self, url: Url) -> <Self as Connect>::Future {
+    fn connect(&self, url: Uri) -> <Self as Connect>::Future {
         self.call(url)
     }
 }
@@ -42,6 +44,7 @@ where T: Service<Request=Url, Error=io::Error> + 'static,
 #[derive(Clone)]
 pub struct HttpConnector {
     dns: dns::Dns,
+    enforce_http: bool,
     handle: Handle,
 }
 
@@ -50,15 +53,26 @@ impl HttpConnector {
     /// Construct a new HttpConnector.
     ///
     /// Takes number of DNS worker threads.
+    #[inline]
     pub fn new(threads: usize, handle: &Handle) -> HttpConnector {
         HttpConnector {
             dns: dns::Dns::new(threads),
+            enforce_http: true,
             handle: handle.clone(),
         }
+    }
+
+    /// Option to enforce all `Uri`s have the `http` scheme.
+    ///
+    /// Enabled by default.
+    #[inline]
+    pub fn enforce_http(&mut self, is_enforced: bool) {
+        self.enforce_http = is_enforced;
     }
 }
 
 impl fmt::Debug for HttpConnector {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("HttpConnector")
             .finish()
@@ -66,28 +80,71 @@ impl fmt::Debug for HttpConnector {
 }
 
 impl Service for HttpConnector {
-    type Request = Url;
+    type Request = Uri;
     type Response = TcpStream;
     type Error = io::Error;
     type Future = HttpConnecting;
 
-    fn call(&self, url: Url) -> Self::Future {
-        debug!("Http::connect({:?})", url);
-        let host = match url.host_str() {
+    fn call(&self, uri: Uri) -> Self::Future {
+        debug!("Http::connect({:?})", uri);
+
+        if self.enforce_http {
+            if uri.scheme() != Some("http") {
+                return invalid_url(InvalidUrl::NotHttp, &self.handle);
+            }
+        } else if uri.scheme().is_none() {
+            return invalid_url(InvalidUrl::MissingScheme, &self.handle);
+        }
+
+        let host = match uri.host() {
             Some(s) => s,
-            None => return HttpConnecting {
-                state: State::Error(Some(io::Error::new(io::ErrorKind::InvalidInput, "invalid url"))),
-                handle: self.handle.clone(),
+            None => return invalid_url(InvalidUrl::MissingAuthority, &self.handle),
+        };
+        let port = match uri.port() {
+            Some(port) => port,
+            None => match uri.scheme() {
+                Some("http") => 80,
+                Some("https") => 443,
+                _ => 80,
             },
         };
-        let port = url.port_or_known_default().unwrap_or(80);
 
         HttpConnecting {
-            state: State::Resolving(self.dns.resolve(host.into(), port)),
+            state: State::Lazy(self.dns.clone(), host.into(), port),
             handle: self.handle.clone(),
         }
     }
+}
 
+#[inline]
+fn invalid_url(err: InvalidUrl, handle: &Handle) -> HttpConnecting {
+    HttpConnecting {
+        state: State::Error(Some(io::Error::new(io::ErrorKind::InvalidInput, err))),
+        handle: handle.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InvalidUrl {
+    MissingScheme,
+    NotHttp,
+    MissingAuthority,
+}
+
+impl fmt::Display for InvalidUrl {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.description())
+    }
+}
+
+impl StdError for InvalidUrl {
+    fn description(&self) -> &str {
+        match *self {
+            InvalidUrl::MissingScheme => "invalid URL, missing scheme",
+            InvalidUrl::NotHttp => "invalid URL, scheme must be http",
+            InvalidUrl::MissingAuthority => "invalid URL, missing domain",
+        }
+    }
 }
 
 /// A Future representing work to connect to a URL.
@@ -97,6 +154,7 @@ pub struct HttpConnecting {
 }
 
 enum State {
+    Lazy(dns::Dns, String, u16),
     Resolving(dns::Query),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
@@ -110,6 +168,10 @@ impl Future for HttpConnecting {
         loop {
             let state;
             match self.state {
+                State::Lazy(ref dns, ref mut host, port) => {
+                    let host = mem::replace(host, String::new());
+                    state = State::Resolving(dns.resolve(host, port));
+                },
                 State::Resolving(ref mut query) => {
                     match try!(query.poll()) {
                         Async::NotReady => return Ok(Async::NotReady),
@@ -185,16 +247,33 @@ impl<S: SslClient> HttpsConnector<S> {
 mod tests {
     use std::io;
     use tokio::reactor::Core;
-    use Url;
     use super::{Connect, HttpConnector};
 
     #[test]
-    fn test_non_http_url() {
+    fn test_errors_missing_authority() {
         let mut core = Core::new().unwrap();
-        let url = Url::parse("file:///home/sean/foo.txt").unwrap();
+        let url = "/foo/bar?baz".parse().unwrap();
         let connector = HttpConnector::new(1, &core.handle());
 
         assert_eq!(core.run(connector.connect(url)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
+    #[test]
+    fn test_errors_enforce_http() {
+        let mut core = Core::new().unwrap();
+        let url = "https://example.domain/foo/bar?baz".parse().unwrap();
+        let connector = HttpConnector::new(1, &core.handle());
+
+        assert_eq!(core.run(connector.connect(url)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+
+    #[test]
+    fn test_errors_missing_scheme() {
+        let mut core = Core::new().unwrap();
+        let url = "example.domain".parse().unwrap();
+        let connector = HttpConnector::new(1, &core.handle());
+
+        assert_eq!(core.run(connector.connect(url)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
 }

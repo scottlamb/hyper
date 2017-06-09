@@ -100,8 +100,8 @@ impl<S: Scheme + Any> Header for Authorization<S> where <S as FromStr>::Err: 'st
         }
     }
 
-    fn fmt_header(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(self, f)
+    fn fmt_header(&self, f: &mut ::header::Formatter) -> fmt::Result {
+        f.fmt_line(self)
     }
 }
 
@@ -158,7 +158,8 @@ impl Scheme for Basic {
         if let Some(ref pass) = self.password {
             text.push_str(&pass[..]);
         }
-        f.write_str(&encode(text.as_ref()))
+
+        f.write_str(&encode(&text))
     }
 }
 

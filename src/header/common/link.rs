@@ -104,9 +104,6 @@ pub struct LinkValue {
     /// Hint on the media type of the result of dereferencing
     /// the link: `type`.
     media_type: Option<Mime>,
-
-    /// Link Extension: `link-extension`.
-    link_extension: Option<String>
 }
 
 /// A Media Descriptors Enum based on:
@@ -258,7 +255,6 @@ impl LinkValue {
             title: None,
             title_star: None,
             media_type: None,
-            link_extension: None,
         }
     }
 
@@ -305,11 +301,6 @@ impl LinkValue {
     /// Get the `LinkValue`'s `type` parameter.
     pub fn media_type(&self) -> Option<&Mime> {
         self.media_type.as_ref()
-    }
-
-    /// Get the `LinkValue`'s `link-extension` parameter.
-    pub fn link_extension(&self) -> Option<&str> {
-        self.link_extension.as_ref().map(AsRef::as_ref)
     }
 
     /// Add a `RelationType` to the `LinkValue`'s `rel` parameter.
@@ -383,13 +374,6 @@ impl LinkValue {
 
         self
     }
-
-    /// Set `LinkValue`'s `link-extension` parameter.
-    pub fn set_link_extension<T: Into<String>>(mut self, link_extension: T) -> LinkValue {
-        self.link_extension = Some(link_extension.into());
-
-        self
-    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -423,14 +407,14 @@ impl Header for Link {
             .unwrap_or(Err(::Error::Header))
     }
 
-    fn fmt_header(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt_delimited(f, self.values.as_slice(), ", ", ("", ""))
+    fn fmt_header(&self, f: &mut ::header::Formatter) -> fmt::Result {
+        f.fmt_line(self)
     }
 }
 
 impl fmt::Display for Link {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.fmt_header(f)
+        fmt_delimited(f, self.values.as_slice(), ", ", ("", ""))
     }
 }
 
@@ -463,9 +447,6 @@ impl fmt::Display for LinkValue {
         }
         if let Some(ref media_type) = self.media_type {
             try!(write!(f, "; type=\"{}\"", media_type));
-        }
-        if let Some(ref link_extension) = self.link_extension {
-            try!(write!(f, "; link-extension={}", link_extension));
         }
 
         Ok(())
@@ -501,7 +482,6 @@ impl FromStr for Link {
                                 title: None,
                                 title_star: None,
                                 media_type: None,
-                                link_extension: None,
                             }
                         },
                     }
@@ -640,16 +620,6 @@ impl FromStr for Link {
                                 },
                             },
 
-                        };
-                    }
-                } else if "link-extension".eq_ignore_ascii_case(link_param_name) {
-                    // Parse target attribute: `link-extension`.
-                    // https://tools.ietf.org/html/rfc5988#section-5.4
-                    if link_header.link_extension.is_none() {
-                        link_header.link_extension = match link_param_split.next() {
-                            None => return Err(::Error::Header),
-                            Some("") =>  return Err(::Error::Header),
-                            Some(s) => Some(String::from(s.trim())),
                         };
                     }
                 } else {
@@ -933,11 +903,9 @@ mod tests {
     use header::Header;
 
     use http::{ServerTransaction, Http1Transaction};
-    use http::buf::MemBuf;
+    use bytes::BytesMut;
 
-    use mime::Mime;
-    use mime::TopLevel::Text;
-    use mime::SubLevel::Plain;
+    use mime;
 
     #[test]
     fn test_link() {
@@ -982,18 +950,17 @@ mod tests {
             .push_rel(RelationType::Previous)
             .set_anchor("../anchor/example/")
             .push_rev(RelationType::Next)
-            .push_href_lang(langtag!(de))
+            .push_href_lang("de".parse().unwrap())
             .push_media_desc(MediaDesc::Screen)
             .set_title("previous chapter")
             .set_title_star("title* unparsed")
-            .set_media_type(Mime(Text, Plain, vec![]))
-            .set_link_extension("link-extension unparsed");
+            .set_media_type(mime::TEXT_PLAIN);
 
         let link_header = b"<http://example.com/TheBook/chapter2>; \
             rel=\"previous\"; anchor=\"../anchor/example/\"; \
             rev=\"next\"; hreflang=de; media=\"screen\"; \
             title=\"previous chapter\"; title*=title* unparsed; \
-            type=\"text/plain\"; link-extension=link-extension unparsed";
+            type=\"text/plain\"";
 
         let expected_link = Link::new(vec![link_value]);
 
@@ -1018,7 +985,7 @@ mod tests {
 
         let expected_link = Link::new(vec![first_link, second_link, third_link]);
 
-        let raw = MemBuf::from(b"GET /super_short_uri/and_whatever HTTP/1.1\r\nHost: \
+        let mut raw = BytesMut::from(b"GET /super_short_uri/and_whatever HTTP/1.1\r\nHost: \
                                   hyper.rs\r\nAccept: a lot of things\r\nAccept-Charset: \
                                   utf8\r\nAccept-Encoding: *\r\nLink: </TheBook/chapter2>; \
                                   rel=\"previous\"; title*=UTF-8'de'letztes%20Kapitel, \
@@ -1029,7 +996,7 @@ mod tests {
                                   rel=\"previous\"; rev=next; title=\"previous chapter\"\
                                   \r\n\r\n".to_vec());
 
-        let (mut res, _) = ServerTransaction::parse(&raw).unwrap().unwrap();
+        let (mut res, _) = ServerTransaction::parse(&mut raw).unwrap().unwrap();
 
         let link = res.headers.remove::<Link>().unwrap();
 
@@ -1042,12 +1009,11 @@ mod tests {
             .push_rel(RelationType::Previous)
             .set_anchor("/anchor/example/")
             .push_rev(RelationType::Next)
-            .push_href_lang(langtag!(de))
+            .push_href_lang("de".parse().unwrap())
             .push_media_desc(MediaDesc::Screen)
             .set_title("previous chapter")
             .set_title_star("title* unparsed")
-            .set_media_type(Mime(Text, Plain, vec![]))
-            .set_link_extension("link-extension unparsed");
+            .set_media_type(mime::TEXT_PLAIN);
 
         let link = Link::new(vec![link_value]);
 
@@ -1058,7 +1024,7 @@ mod tests {
             rel=\"previous\"; anchor=\"/anchor/example/\"; \
             rev=\"next\"; hreflang=de; media=\"screen\"; \
             title=\"previous chapter\"; title*=title* unparsed; \
-            type=\"text/plain\"; link-extension=link-extension unparsed";
+            type=\"text/plain\"";
 
         assert_eq!(link_header, expected_link_header);
     }

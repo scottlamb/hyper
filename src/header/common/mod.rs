@@ -3,7 +3,7 @@
 //! ## Mime
 //!
 //! Several header fields use MIME values for their contents. Keeping with the
-//! strongly-typed theme, the [mime](http://seanmonstar.github.io/mime.rs) crate
+//! strongly-typed theme, the [mime](https://docs.rs/mime) crate
 //! is used, such as `ContentType(pub Mime)`.
 
 pub use self::accept::Accept;
@@ -30,7 +30,7 @@ pub use self::content_language::ContentLanguage;
 pub use self::content_location::ContentLocation;
 pub use self::content_range::{ContentRange, ContentRangeSpec};
 pub use self::content_type::ContentType;
-pub use self::cookie::Cookie;
+pub use self::cookie::{Cookie, CookieIter};
 pub use self::date::Date;
 pub use self::etag::ETag;
 pub use self::expect::Expect;
@@ -101,12 +101,14 @@ macro_rules! __hyper__deref {
         impl ::std::ops::Deref for $from {
             type Target = $to;
 
+            #[inline]
             fn deref(&self) -> &$to {
                 &self.0
             }
         }
 
         impl ::std::ops::DerefMut for $from {
+            #[inline]
             fn deref_mut(&mut self) -> &mut $to {
                 &mut self.0
             }
@@ -201,17 +203,19 @@ macro_rules! header {
                 static NAME: &'static str = $n;
                 NAME
             }
+            #[inline]
             fn parse_header(raw: &$crate::header::Raw) -> $crate::Result<Self> {
                 $crate::header::parsing::from_comma_delimited(raw).map($id)
             }
-            fn fmt_header(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-                $crate::header::parsing::fmt_comma_delimited(f, &self.0[..])
+            #[inline]
+            fn fmt_header(&self, f: &mut $crate::header::Formatter) -> ::std::fmt::Result {
+                f.fmt_line(self)
             }
         }
         impl ::std::fmt::Display for $id {
+            #[inline]
             fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-                use $crate::header::Header;
-                self.fmt_header(f)
+                $crate::header::parsing::fmt_comma_delimited(f, &self.0[..])
             }
         }
     };
@@ -222,21 +226,24 @@ macro_rules! header {
         pub struct $id(pub Vec<$item>);
         __hyper__deref!($id => Vec<$item>);
         impl $crate::header::Header for $id {
+            #[inline]
             fn header_name() -> &'static str {
                 static NAME: &'static str = $n;
                 NAME
             }
+            #[inline]
             fn parse_header(raw: &$crate::header::Raw) -> $crate::Result<Self> {
                 $crate::header::parsing::from_comma_delimited(raw).map($id)
             }
-            fn fmt_header(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-                $crate::header::parsing::fmt_comma_delimited(f, &self.0[..])
+            #[inline]
+            fn fmt_header(&self, f: &mut $crate::header::Formatter) -> ::std::fmt::Result {
+                f.fmt_line(self)
             }
         }
         impl ::std::fmt::Display for $id {
+            #[inline]
             fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-                use $crate::header::Header;
-                self.fmt_header(f)
+                $crate::header::parsing::fmt_comma_delimited(f, &self.0[..])
             }
         }
     };
@@ -247,20 +254,64 @@ macro_rules! header {
         pub struct $id(pub $value);
         __hyper__deref!($id => $value);
         impl $crate::header::Header for $id {
+            #[inline]
             fn header_name() -> &'static str {
                 static NAME: &'static str = $n;
                 NAME
             }
+            #[inline]
             fn parse_header(raw: &$crate::header::Raw) -> $crate::Result<Self> {
                 $crate::header::parsing::from_one_raw_str(raw).map($id)
             }
-            fn fmt_header(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-                ::std::fmt::Display::fmt(&**self, f)
+            #[inline]
+            fn fmt_header(&self, f: &mut $crate::header::Formatter) -> ::std::fmt::Result {
+                f.fmt_line(self)
             }
         }
         impl ::std::fmt::Display for $id {
+            #[inline]
             fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-                ::std::fmt::Display::fmt(&**self, f)
+                ::std::fmt::Display::fmt(&self.0, f)
+            }
+        }
+    };
+    // Single value cow header
+    ($(#[$a:meta])*($id:ident, $n:expr) => Cow[$value:ty]) => {
+        $(#[$a])*
+        #[derive(Clone, Debug, PartialEq)]
+        pub struct $id(::std::borrow::Cow<'static,$value>);
+        impl $id {
+            /// Creates a new $id
+            pub fn new<I: Into<::std::borrow::Cow<'static,$value>>>(value: I) -> Self {
+                $id(value.into())
+            }
+        }
+        impl ::std::ops::Deref for $id {
+            type Target = $value;
+            #[inline]
+            fn deref(&self) -> &Self::Target {
+                &(self.0)
+            }
+        }
+        impl $crate::header::Header for $id {
+            #[inline]
+            fn header_name() -> &'static str {
+                static NAME: &'static str = $n;
+                NAME
+            }
+            #[inline]
+            fn parse_header(raw: &$crate::header::Raw) -> $crate::Result<Self> {
+                $crate::header::parsing::from_one_raw_str::<<$value as ::std::borrow::ToOwned>::Owned>(raw).map($id::new)
+            }
+            #[inline]
+            fn fmt_header(&self, f: &mut $crate::header::Formatter) -> ::std::fmt::Result {
+                f.fmt_line(self)
+            }
+        }
+        impl ::std::fmt::Display for $id {
+            #[inline]
+            fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+                ::std::fmt::Display::fmt(&self.0, f)
             }
         }
     };
@@ -275,10 +326,12 @@ macro_rules! header {
             Items(Vec<$item>),
         }
         impl $crate::header::Header for $id {
+            #[inline]
             fn header_name() -> &'static str {
                 static NAME: &'static str = $n;
                 NAME
             }
+            #[inline]
             fn parse_header(raw: &$crate::header::Raw) -> $crate::Result<Self> {
                 // FIXME: Return None if no item is in $id::Only
                 if raw.len() == 1 {
@@ -288,18 +341,19 @@ macro_rules! header {
                 }
                 $crate::header::parsing::from_comma_delimited(raw).map($id::Items)
             }
-            fn fmt_header(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+            #[inline]
+            fn fmt_header(&self, f: &mut $crate::header::Formatter) -> ::std::fmt::Result {
+                f.fmt_line(self)
+            }
+        }
+        impl ::std::fmt::Display for $id {
+            #[inline]
+            fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
                 match *self {
                     $id::Any => f.write_str("*"),
                     $id::Items(ref fields) => $crate::header::parsing::fmt_comma_delimited(
                         f, &fields[..])
                 }
-            }
-        }
-        impl ::std::fmt::Display for $id {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-                use $crate::header::Header;
-                self.fmt_header(f)
             }
         }
     };
@@ -325,6 +379,14 @@ macro_rules! header {
         header! {
             $(#[$a])*
             ($id, $n) => [$item]
+        }
+
+        __hyper__tm! { $id, $tm { $($tf)* }}
+    };
+    ($(#[$a:meta])*($id:ident, $n:expr) => Cow[$item:ty] $tm:ident{$($tf:item)*}) => {
+        header! {
+            $(#[$a])*
+            ($id, $n) => Cow[$item]
         }
 
         __hyper__tm! { $id, $tm { $($tf)* }}

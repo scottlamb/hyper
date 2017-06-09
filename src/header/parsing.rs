@@ -9,6 +9,7 @@ use url::percent_encoding;
 use header::Raw;
 use header::shared::Charset;
 
+
 /// Reads a single raw string when parsing a header.
 pub fn from_one_raw_str<T: str::FromStr>(raw: &Raw) -> ::Result<T> {
     if let Some(line) = raw.one() {
@@ -43,10 +44,12 @@ pub fn from_comma_delimited<T: str::FromStr>(raw: &Raw) -> ::Result<Vec<T>> {
 
 /// Format an array into a comma-delimited string.
 pub fn fmt_comma_delimited<T: Display>(f: &mut fmt::Formatter, parts: &[T]) -> fmt::Result {
-    for (i, part) in parts.iter().enumerate() {
-        if i != 0 {
-            try!(f.write_str(", "));
-        }
+    let mut iter = parts.iter();
+    if let Some(part) = iter.next() {
+        try!(Display::fmt(part, f));
+    }
+    for part in iter {
+        try!(f.write_str(", "));
         try!(Display::fmt(part, f));
     }
     Ok(())
@@ -132,25 +135,11 @@ pub fn parse_extended_value(val: &str) -> ::Result<ExtendedValue> {
     })
 }
 
-define_encode_set! {
-    /// This encode set is used for HTTP header values and is defined at
-    /// https://tools.ietf.org/html/rfc5987#section-3.2
-    pub HTTP_VALUE = [percent_encoding::SIMPLE_ENCODE_SET] | {
-        ' ', '"', '%', '\'', '(', ')', '*', ',', '/', ':', ';', '<', '-', '>', '?',
-        '[', '\\', ']', '{', '}'
-    }
-}
-
-impl fmt::Debug for HTTP_VALUE {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.pad("HTTP_VALUE")
-    }
-}
 
 impl Display for ExtendedValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let encoded_value =
-            percent_encoding::percent_encode(&self.value[..], HTTP_VALUE);
+            percent_encoding::percent_encode(&self.value[..], self::percent_encoding_http::HTTP_VALUE);
         if let Some(ref lang) = self.language_tag {
             write!(f, "{}'{}'{}", self.charset, lang, encoded_value)
         } else {
@@ -159,14 +148,42 @@ impl Display for ExtendedValue {
     }
 }
 
+/// Percent encode a sequence of bytes with a character set defined in
+/// https://tools.ietf.org/html/rfc5987#section-3.2
+pub fn http_percent_encode(f: &mut fmt::Formatter, bytes: &[u8]) -> fmt::Result {
+    let encoded = percent_encoding::percent_encode(bytes, self::percent_encoding_http::HTTP_VALUE);
+    fmt::Display::fmt(&encoded, f)
+}
+
+mod percent_encoding_http {
+    use std::fmt;
+    use url::percent_encoding;
+
+    define_encode_set! {
+        /// This encode set is used for HTTP header values and is defined at
+        /// https://tools.ietf.org/html/rfc5987#section-3.2
+        pub HTTP_VALUE = [percent_encoding::SIMPLE_ENCODE_SET] | {
+            ' ', '"', '%', '\'', '(', ')', '*', ',', '/', ':', ';', '<', '-', '>', '?',
+            '[', '\\', ']', '{', '}'
+        }
+    }
+
+    impl fmt::Debug for HTTP_VALUE {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.pad("HTTP_VALUE")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use header::shared::Charset;
     use super::{ExtendedValue, parse_extended_value};
+    use language_tags::LanguageTag;
 
     #[test]
     fn test_parse_extended_value_with_encoding_and_language_tag() {
-        let expected_language_tag = langtag!(en);
+        let expected_language_tag = "en".parse::<LanguageTag>().unwrap();
         // RFC 5987, Section 3.2.2
         // Extended notation, using the Unicode character U+00A3 (POUND SIGN)
         let result = parse_extended_value("iso-8859-1'en'%A3%20rates");

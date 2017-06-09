@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use futures::future;
 use futures::task::{self, Task};
-use futures::{Future, Map, Stream, Poll, Async, Sink, StartSend, AsyncSink};
+use futures::{Future, Stream, Poll, Async, Sink, StartSend, AsyncSink};
+use futures::future::Map;
 
-use tokio::io::Io;
+use tokio_io::{AsyncRead, AsyncWrite};
 use tokio::reactor::{Core, Handle, Timeout};
 use tokio::net::TcpListener;
 use tokio_proto::BindServer;
@@ -23,13 +24,12 @@ use tokio_proto::streaming::Message;
 use tokio_proto::streaming::pipeline::{Transport, Frame, ServerProto};
 pub use tokio_service::{NewService, Service};
 
-pub use self::request::Request;
-pub use self::response::Response;
-
 use http;
+use http::response;
+use http::request;
 
-mod request;
-mod response;
+pub use http::response::Response;
+pub use http::request::Request;
 
 /// An instance of the HTTP protocol, and implementation of tokio-proto's
 /// `ServerProto` trait.
@@ -114,7 +114,7 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
     /// will be handled (and mapped to responses).
     ///
     /// This method is typically not invoked directly but is rather transitively
-    /// used through the `serve` helper method above. This can be useful,
+    /// used through [`bind`](#method.bind). This can be useful,
     /// however, when writing mocks or accepting sockets from a non-TCP
     /// location.
     pub fn bind_connection<S, I, Bd>(&self,
@@ -124,7 +124,7 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
                                  service: S)
         where S: Service<Request = Request, Response = Response<Bd>, Error = ::Error> + 'static,
               Bd: Stream<Item=B, Error=::Error> + 'static,
-              I: Io + 'static,
+              I: AsyncRead + AsyncWrite + 'static,
     {
         self.bind_server(handle, io, HttpService {
             inner: service,
@@ -165,8 +165,8 @@ pub struct __ProtoBindTransport<T, B> {
 }
 
 impl<T, B> ServerProto<T> for Http<B>
-where T: Io + 'static,
-      B: AsRef<[u8]> + 'static,
+    where T: AsyncRead + AsyncWrite + 'static,
+          B: AsRef<[u8]> + 'static,
 {
     type Request = __ProtoRequest;
     type RequestBody = http::Chunk;
@@ -189,8 +189,8 @@ where T: Io + 'static,
 }
 
 impl<T, B> Sink for __ProtoTransport<T, B>
-where T: Io + 'static,
-      B: AsRef<[u8]>,
+    where T: AsyncRead + AsyncWrite + 'static,
+          B: AsRef<[u8]> + 'static,
 {
     type SinkItem = Frame<__ProtoResponse, B, ::Error>;
     type SinkError = io::Error;
@@ -224,9 +224,16 @@ where T: Io + 'static,
     fn poll_complete(&mut self) -> Poll<(), io::Error> {
         self.0.poll_complete()
     }
+
+    fn close(&mut self) -> Poll<(), io::Error> {
+        self.0.close()
+    }
 }
 
-impl<T: Io + 'static, B: AsRef<[u8]>> Stream for __ProtoTransport<T, B> {
+impl<T, B> Stream for __ProtoTransport<T, B>
+    where T: AsyncRead + AsyncWrite + 'static,
+          B: AsRef<[u8]> + 'static,
+{
     type Item = Frame<__ProtoRequest, http::Chunk, ::Error>;
     type Error = io::Error;
 
@@ -246,7 +253,10 @@ impl<T: Io + 'static, B: AsRef<[u8]>> Stream for __ProtoTransport<T, B> {
     }
 }
 
-impl<T: Io + 'static, B: AsRef<[u8]> + 'static> Transport for __ProtoTransport<T, B> {
+impl<T, B> Transport for __ProtoTransport<T, B>
+    where T: AsyncRead + AsyncWrite + 'static,
+          B: AsRef<[u8]> + 'static,
+{
     fn tick(&mut self) {
         self.0.tick()
     }
@@ -256,7 +266,9 @@ impl<T: Io + 'static, B: AsRef<[u8]> + 'static> Transport for __ProtoTransport<T
     }
 }
 
-impl<T: Io + 'static, B> Future for __ProtoBindTransport<T, B> {
+impl<T, B> Future for __ProtoBindTransport<T, B>
+    where T: AsyncRead + AsyncWrite + 'static,
+{
     type Item = __ProtoTransport<T, B>;
     type Error = io::Error;
 
@@ -271,7 +283,7 @@ impl From<Message<__ProtoRequest, http::TokioBody>> for Request {
             Message::WithoutBody(head) => (head.0, http::Body::empty()),
             Message::WithBody(head, body) => (head.0, body.into()),
         };
-        request::new(None, head, body)
+        request::from_wire(None, head, body)
     }
 }
 
@@ -308,7 +320,7 @@ impl<T, B> Service for HttpService<T>
             Message::WithoutBody(head) => (head.0, http::Body::empty()),
             Message::WithBody(head, body) => (head.0, body.into()),
         };
-        let req = request::new(Some(self.remote_addr), head, body);
+        let req = request::from_wire(Some(self.remote_addr), head, body);
         self.inner.call(req).map(Into::into)
     }
 }
@@ -468,7 +480,7 @@ impl<S> Drop for NotifyService<S> {
         info.active -= 1;
         if info.active == 0 {
             if let Some(task) = info.blocker.take() {
-                task.unpark();
+                task.notify();
             }
         }
     }
@@ -483,7 +495,7 @@ impl Future for WaitUntilZero {
         if info.active == 0 {
             Ok(().into())
         } else {
-            info.blocker = Some(task::park());
+            info.blocker = Some(task::current());
             Ok(Async::NotReady)
         }
     }
