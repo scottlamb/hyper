@@ -411,7 +411,9 @@ impl NetworkConnector for HttpConnector {
         Ok(try!(match scheme {
             "http" => {
                 debug!("http scheme");
-                Ok(HttpStream(try!(TcpStream::connect(addr))))
+                let stream = try!(TcpStream::connect(addr));
+                try!(stream.set_nodelay(true));
+                Ok(HttpStream(stream))
             },
             _ => {
                 Err(io::Error::new(io::ErrorKind::InvalidInput,
