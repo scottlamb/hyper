@@ -103,7 +103,6 @@ impl Service for HttpConnector {
         let port = match uri.port() {
             Some(port) => port,
             None => match uri.scheme() {
-                Some("http") => 80,
                 Some("https") => 443,
                 _ => 80,
             },
@@ -148,6 +147,7 @@ impl StdError for InvalidUrl {
 }
 
 /// A Future representing work to connect to a URL.
+#[must_use = "futures do nothing unless polled"]
 pub struct HttpConnecting {
     state: State,
     handle: Handle,

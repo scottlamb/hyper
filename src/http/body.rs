@@ -2,12 +2,14 @@ use bytes::Bytes;
 use futures::{Poll, Stream};
 use futures::sync::mpsc;
 use tokio_proto;
+use std::borrow::Cow;
 
 use http::Chunk;
 
 pub type TokioBody = tokio_proto::streaming::Body<Chunk, ::Error>;
 
 /// A `Stream` for `Chunk`s used in requests and responses.
+#[must_use = "streams do nothing unless polled"]
 #[derive(Debug)]
 pub struct Body(TokioBody);
 
@@ -93,6 +95,17 @@ impl From<&'static [u8]> for Body {
     }
 }
 
+impl From<Cow<'static, [u8]>> for Body {
+    #[inline]
+    fn from (cow: Cow<'static, [u8]>) -> Body {
+        if let Cow::Borrowed(value) = cow {
+            Body::from(value)
+        } else {
+            Body::from(cow.to_owned())
+        }
+    }
+}
+
 impl From<String> for Body {
     #[inline]
     fn from (s: String) -> Body {
@@ -102,8 +115,19 @@ impl From<String> for Body {
 
 impl From<&'static str> for Body {
     #[inline]
-    fn from (slice: &'static str) -> Body {
+    fn from(slice: &'static str) -> Body {
         Body(TokioBody::from(Chunk::from(slice.as_bytes())))
+    }
+}
+
+impl From<Cow<'static, str>> for Body {
+    #[inline]
+    fn from(cow: Cow<'static, str>) -> Body {
+        if let Cow::Borrowed(value) = cow {
+            Body::from(value)
+        } else {
+            Body::from(cow.to_owned())
+        }
     }
 }
 

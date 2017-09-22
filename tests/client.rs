@@ -12,7 +12,7 @@ use std::time::Duration;
 use hyper::client::{Client, Request, HttpConnector};
 use hyper::{Method, StatusCode};
 
-use futures::Future;
+use futures::{Future, Stream};
 use futures::sync::oneshot;
 
 use tokio_core::reactor::{Core, Handle};
@@ -68,7 +68,9 @@ macro_rules! test {
 
             let (tx, rx) = oneshot::channel();
 
-            thread::spawn(move || {
+            let thread = thread::Builder::new()
+                .name(format!("tcp-server<{}>", stringify!($name)));
+            thread.spawn(move || {
                 let mut inc = server.accept().unwrap().0;
                 inc.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 inc.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -76,13 +78,16 @@ macro_rules! test {
                 let mut buf = [0; 4096];
                 let mut n = 0;
                 while n < buf.len() && n < expected.len() {
-                    n += inc.read(&mut buf[n..]).unwrap();
+                    n += match inc.read(&mut buf[n..]) {
+                        Ok(n) => n,
+                        Err(e) => panic!("failed to read request, partialy read = {:?}, error: {}", s(&buf[..n]), e),
+                    };
                 }
                 assert_eq!(s(&buf[..n]), expected);
 
                 inc.write_all($server_reply.as_ref()).unwrap();
                 let _ = tx.send(());
-            });
+            }).unwrap();
 
             let rx = rx.map_err(|_| hyper::Error::Io(io::Error::new(io::ErrorKind::Other, "thread panicked")));
 
@@ -93,6 +98,12 @@ macro_rules! test {
             $(
                 assert_eq!(res.headers().get(), Some(&$response_headers));
             )*
+
+            let body = core.run(res.body().concat2()).unwrap();
+
+            let expected_res_body = Option::<&[u8]>::from($response_body)
+                .unwrap_or_default();
+            assert_eq!(body.as_ref(), expected_res_body);
         }
     );
 }
@@ -219,6 +230,36 @@ test! {
             headers: [],
             body: None,
             proxy: true,
+        response:
+            status: Ok,
+            headers: [],
+            body: None,
+}
+
+
+test! {
+    name: client_head_ignores_body,
+
+    server:
+        expected: "\
+            HEAD /head HTTP/1.1\r\n\
+            Host: {addr}\r\n\
+            \r\n\
+            ",
+        reply: "\
+            HTTP/1.1 200 OK\r\n\
+            Content-Length: 11\r\n\
+            \r\n\
+            Hello World\
+            ",
+
+    client:
+        request:
+            method: Head,
+            url: "http://{addr}/head",
+            headers: [],
+            body: None,
+            proxy: false,
         response:
             status: Ok,
             headers: [],

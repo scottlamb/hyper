@@ -54,21 +54,23 @@ impl Encoder {
                 chunked.encode(w, msg)
             },
             Kind::Length(ref mut remaining) => {
+                if msg.is_empty() {
+                    return Ok(0);
+                }
                 let n = {
                     let max = cmp::min(*remaining as usize, msg.len());
-                    trace!("sized write, len = {}", max);
+                    trace!("sized write = {}", max);
                     let slice = &msg[..max];
 
                     try!(w.write_atomic(&[slice]))
                 };
 
                 if n == 0 {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "would block"));
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"));
                 }
 
                 *remaining -= n as u64;
-                debug!("encoded {} bytes", n);
-                trace!("encode sized complete, remaining = {}", remaining);
+                trace!("encoded {} bytes, remaining = {}", n, remaining);
                 Ok(n)
             },
         }
@@ -200,7 +202,7 @@ impl Chunked {
         match *self {
             Chunked::Init |
             Chunked::End => Ok(msg.len()),
-            _ => Err(io::Error::new(io::ErrorKind::WouldBlock, "chunked incomplete"))
+            _ => Err(io::ErrorKind::WouldBlock.into())
         }
     }
 }

@@ -140,7 +140,8 @@ pub struct Basic {
     /// The username as a possibly empty string
     pub username: String,
     /// The password. `None` if the `:` delimiter character was not
-    /// part of the parsed input.
+    /// part of the parsed input. Note: A compliant client MUST
+    /// always send a password (which may be the empty string).
     pub password: Option<String>
 }
 
@@ -169,7 +170,7 @@ impl FromStr for Basic {
         match decode(s) {
             Ok(decoded) => match String::from_utf8(decoded) {
                 Ok(text) => {
-                    let mut parts = &mut text.split(':');
+                    let parts = &mut text.split(':');
                     let user = match parts.next() {
                         Some(part) => part.to_owned(),
                         None => return Err(::Error::Header)
@@ -183,13 +184,13 @@ impl FromStr for Basic {
                         password: password
                     })
                 },
-                Err(e) => {
-                    debug!("Basic::from_utf8 error={:?}", e);
+                Err(_) => {
+                    debug!("Basic::from_str utf8 error");
                     Err(::Error::Header)
                 }
             },
-            Err(e) => {
-                debug!("Basic::from_base64 error={:?}", e);
+            Err(_) => {
+                debug!("Basic::from_str base64 error");
                 Err(::Error::Header)
             }
         }

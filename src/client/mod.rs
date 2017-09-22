@@ -24,6 +24,7 @@ use http::request;
 use method::Method;
 use self::pool::{Pool, Pooled};
 use uri::{self, Uri};
+use version::HttpVersion;
 
 pub use http::response::Response;
 pub use http::request::Request;
@@ -76,7 +77,7 @@ impl Client<HttpConnector, http::Body> {
 impl<C, B> Client<C, B> {
     /// Return a reference to a handle to the event loop this Client is associated with.
     #[inline]
-    pub fn handle<'a>(&'a self) -> &'a Handle {
+    pub fn handle(&self) -> &Handle {
         &self.handle
     }
 
@@ -110,6 +111,7 @@ where C: Connect,
 }
 
 /// A `Future` that will resolve to an HTTP Response.
+#[must_use = "futures do nothing unless polled"]
 pub struct FutureResponse(Box<Future<Item=Response, Error=::Error> + 'static>);
 
 impl fmt::Debug for FutureResponse {
@@ -138,6 +140,15 @@ where C: Connect,
     type Future = FutureResponse;
 
     fn call(&self, req: Self::Request) -> Self::Future {
+        match req.version() {
+            HttpVersion::Http10 |
+            HttpVersion::Http11 => (),
+            other => {
+                error!("Request has unsupported version \"{}\"", other);
+                return FutureResponse(Box::new(future::err(::Error::Version)));
+            }
+        }
+
         let url = req.uri().clone();
         let domain = match uri::scheme_and_authority(&url) {
             Some(uri) => uri,
@@ -184,7 +195,7 @@ where C: Connect,
                 // never had a pooled stream at all
                 e.into()
             });
-        let req = race.and_then(move |client| {
+        let resp = race.and_then(move |client| {
             let msg = match body {
                 Some(body) => {
                     Message::WithBody(head, body.into())
@@ -193,7 +204,7 @@ where C: Connect,
             };
             client.call(msg)
         });
-        FutureResponse(Box::new(req.map(|msg| {
+        FutureResponse(Box::new(resp.map(|msg| {
             match msg {
                 Message::WithoutBody(head) => response::from_wire(head, None),
                 Message::WithBody(head, body) => response::from_wire(head, Some(body.into())),

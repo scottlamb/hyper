@@ -59,6 +59,11 @@ impl<V: ?Sized + Any + 'static> PtrMapCell<V> {
     }
 
     #[inline]
+    pub fn with_one(key: TypeId, val: Box<V>)  -> PtrMapCell<V> {
+        PtrMapCell(UnsafeCell::new(PtrMap::One(key, val)))
+    }
+
+    #[inline]
     pub fn get(&self, key: TypeId) -> Option<&V> {
         let map = unsafe { &*self.0.get() };
         match *map {
@@ -74,7 +79,7 @@ impl<V: ?Sized + Any + 'static> PtrMapCell<V> {
 
     #[inline]
     pub fn get_mut(&mut self, key: TypeId) -> Option<&mut V> {
-        let mut map = unsafe { &mut *self.0.get() };
+        let map = unsafe { &mut *self.0.get() };
         match *map {
             PtrMap::Empty => None,
             PtrMap::One(id, ref mut v) => if id == key {
@@ -102,14 +107,14 @@ impl<V: ?Sized + Any + 'static> PtrMapCell<V> {
 
     #[inline]
     pub unsafe fn insert(&self, key: TypeId, val: Box<V>) {
-        let mut map = &mut *self.0.get();
+        let map = &mut *self.0.get();
         match *map {
             PtrMap::Empty => *map = PtrMap::One(key, val),
             PtrMap::One(..) => {
                 let one = mem::replace(map, PtrMap::Empty);
                 match one {
                     PtrMap::One(id, one) => {
-                        debug_assert!(id != key);
+                        debug_assert_ne!(id, key);
                         let mut hm = HashMap::with_capacity(2);
                         hm.insert(id, one);
                         hm.insert(key, val);
