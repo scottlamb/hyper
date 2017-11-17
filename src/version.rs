@@ -5,6 +5,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+#[cfg(feature = "compat")]
+use http;
+
 use error::Error;
 use self::HttpVersion::{Http09, Http10, Http11, H2, H2c};
 
@@ -55,6 +58,39 @@ impl FromStr for HttpVersion {
 impl Default for HttpVersion {
     fn default() -> HttpVersion {
         Http11
+    }
+}
+
+#[cfg(feature = "compat")]
+impl From<http::Version> for HttpVersion {
+    fn from(v: http::Version) -> HttpVersion {
+        match v {
+            http::Version::HTTP_09 =>
+                HttpVersion::Http09,
+            http::Version::HTTP_10 =>
+                HttpVersion::Http10,
+            http::Version::HTTP_11 =>
+                HttpVersion::Http11,
+            http::Version::HTTP_2 =>
+                HttpVersion::H2
+        }
+    }
+}
+
+#[cfg(feature = "compat")]
+impl From<HttpVersion> for http::Version {
+    fn from(v: HttpVersion) -> http::Version {
+        match v {
+            HttpVersion::Http09 =>
+                http::Version::HTTP_09,
+            HttpVersion::Http10 =>
+                http::Version::HTTP_10,
+            HttpVersion::Http11 =>
+                http::Version::HTTP_11,
+            HttpVersion::H2 =>
+                http::Version::HTTP_2,
+            _ => panic!("attempted to convert unexpected http version")
+        }
     }
 }
 

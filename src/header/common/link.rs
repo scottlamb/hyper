@@ -1,6 +1,7 @@
 use std::fmt;
 use std::borrow::Cow;
 use std::str::FromStr;
+#[allow(unused)]
 use std::ascii::AsciiExt;
 
 use mime::Mime;
@@ -13,7 +14,8 @@ use header::{Header, Raw};
 /// [RFC5988](http://tools.ietf.org/html/rfc5988#section-5)
 ///
 /// # ABNF
-/// ```plain
+///
+/// ```text
 /// Link           = "Link" ":" #link-value
 /// link-value     = "<" URI-Reference ">" *( ";" link-param )
 /// link-param     = ( ( "rel" "=" relation-types )
@@ -54,6 +56,7 @@ use header::{Header, Raw};
 ///        </TheBook/chapter4>; rel="next"; title*=UTF-8'de'n%c3%a4chstes%20Kapitel`
 ///
 /// # Examples
+///
 /// ```
 /// use hyper::header::{Headers, Link, LinkValue, RelationType};
 ///
@@ -107,7 +110,9 @@ pub struct LinkValue {
 }
 
 /// A Media Descriptors Enum based on:
-/// https://www.w3.org/TR/html401/types.html#h-6.13
+/// [https://www.w3.org/TR/html401/types.html#h-6.13][url]
+///
+/// [url]: https://www.w3.org/TR/html401/types.html#h-6.13
 #[derive(Clone, PartialEq, Debug)]
 pub enum MediaDesc {
     /// screen.
@@ -870,7 +875,7 @@ fn verify_and_trim(s: &str, b: (u8, u8)) -> ::Result<&str> {
     let byte_array = s.as_bytes();
 
     // Verify that `s` starts with `b.0` and ends with `b.1` and return
-    // the contained substring after triming whitespace.
+    // the contained substring after trimming whitespace.
     if length > 1 && b.0 == byte_array[0] && b.1 == byte_array[length - 1] {
         Ok(s.trim_matches(
             |c: char| c == b.0 as char || c == b.1 as char || c.is_whitespace())
@@ -894,7 +899,7 @@ mod tests {
 
     use header::Header;
 
-    use http::{ServerTransaction, Http1Transaction};
+    use proto::{ServerTransaction, Http1Transaction};
     use bytes::BytesMut;
 
     use mime;

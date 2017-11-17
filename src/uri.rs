@@ -2,6 +2,9 @@ use std::error::Error as StdError;
 use std::fmt::{Display, self};
 use std::str::{self, FromStr};
 
+#[cfg(feature = "compat")]
+use http;
+
 use ::common::ByteStr;
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -87,7 +90,7 @@ impl Uri {
                 query_start: query,
                 fragment_start: fragment,
             })
-        } else if (s.contains("/") || s.contains("?")) && !s.contains("://") {
+        } else if s.contains("/") || s.contains("?") {
             // last possibility is authority-form, above are illegal characters
             Err(UriError(ErrorKind::Malformed))
         } else {
@@ -312,6 +315,23 @@ impl fmt::Debug for Uri {
 impl Display for Uri {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(self.as_ref())
+    }
+}
+
+#[cfg(feature = "compat")]
+impl From<http::Uri> for Uri {
+    fn from(uri: http::Uri) -> Uri {
+        uri.to_string().parse()
+            .expect("attempted to convert invalid uri")
+    }
+}
+
+#[cfg(feature = "compat")]
+impl From<Uri> for http::Uri {
+    fn from(uri: Uri) -> http::Uri {
+        let bytes = uri.source.into_bytes();
+        http::Uri::from_shared(bytes)
+            .expect("attempted to convert invalid uri")
     }
 }
 

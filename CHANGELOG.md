@@ -1,3 +1,79 @@
+### v0.11.7 (2017-11-14)
+
+
+#### Bug Fixes
+
+* **client:**
+  * drop in-use connections when they finish if Client is dropped ([b1765dd1](https://github.com/hyperium/hyper/commit/b1765dd168b24912fbd36682f1f6df70eeb1acd5))
+  * don't read extra bytes on idle connections ([7c4b814e](https://github.com/hyperium/hyper/commit/7c4b814e6b95bdb22b11e027b2da16c5abb8399f))
+* **server:** GET requests with no body have None instead of Empty ([8bf79648](https://github.com/hyperium/hyper/commit/8bf7964875205155e3018902a6e8facee6c145b6), closes [#1373](https://github.com/hyperium/hyper/issues/1373))
+
+
+#### Features
+
+* **client:**
+  * skip dns resolution when host is a valid ip addr ([b1785c66](https://github.com/hyperium/hyper/commit/b1785c662bc75f7bbd36a242c379d120ff7c6cd2))
+  * allow custom executors for HttpConnector ([ed497bf5](https://github.com/hyperium/hyper/commit/ed497bf5e6f1d651e3b30fd42c10245c560aff5b))
+  * add names to DNS threads ([e0de55da](https://github.com/hyperium/hyper/commit/e0de55daa2ec241f97fc5ed14f5ec933bde110d7))
+* **header:** implement `ByteRangeSpec::to_satisfiable_range` ([bb54e36c](https://github.com/hyperium/hyper/commit/bb54e36c90dc9c2ca876cd7f2c7dc7250d217552))
+* **lib:** add support to disable tokio-proto internals ([f7532b71](https://github.com/hyperium/hyper/commit/f7532b71d141ebe41172dbb863d58d519e387a4e))
+* **server:**
+  * add `const_service` and `service_fn` helpers ([fe38aa4b](https://github.com/hyperium/hyper/commit/fe38aa4bc1c8fdcaefb0d839239c14620a7b8f0a))
+  * add `server::Serve` that can use a shared Handle ([39cf6ef7](https://github.com/hyperium/hyper/commit/39cf6ef7d26b3d829ec19fb1db176e8221170cb3))
+  * allow creating Server with shared Handle ([0844dede](https://github.com/hyperium/hyper/commit/0844dede191d720e0336ee4aca63af2255abe458))
+
+
+### v0.11.6 (2017-10-02)
+
+
+#### Bug Fixes
+
+* **server:** fix experimental pipeline flushing ([6b4635fd](https://github.com/hyperium/hyper/commit/6b4635fd13f5fe91ad6d388c5e66394627ad7ba2))
+
+
+### v0.11.5 (2017-10-02)
+
+
+#### Bug Fixes
+
+* **http:** avoid infinite recursion when Body::from is called with Cow::Owned. (#1343) ([e8d61737](https://github.com/hyperium/hyper/commit/e8d6173734b0fb43bf7401fdbe43258d913a6284))
+
+
+### v0.11.4 (2017-09-28)
+
+
+#### Bug Fixes
+
+* **client:**  fix panic in Pool ([0fbc215f](https://github.com/hyperium/hyper/commit/0fbc215f), closes [#1339](https://github.com/hyperium/hyper/issues/1339))
+
+
+### v0.11.3 (2017-09-28)
+
+
+#### Features
+
+* **header:**  add ContentType::xml() constructor ([92595e84](https://github.com/hyperium/hyper/commit/92595e84))
+* **http:**  add Body::from(cow) for bytes and strings ([425ff71d](https://github.com/hyperium/hyper/commit/425ff71d))
+* **lib:**  implement compatibility with http crate ([0c7d375b](https://github.com/hyperium/hyper/commit/0c7d375b))
+* **server:**
+  *  add experimental pipeline flush aggregation option to Http ([dd54f20b](https://github.com/hyperium/hyper/commit/dd54f20b))
+  *  remove unneeded Send + Sync from Server ([16e834d3](https://github.com/hyperium/hyper/commit/16e834d3))
+
+#### Bug Fixes
+
+* **client:**
+  *  cleanup dropped pending Checkouts from Pool ([3b91fc65](https://github.com/hyperium/hyper/commit/3b91fc65), closes [#1315](https://github.com/hyperium/hyper/issues/1315))
+  *  return Version errors if unsupported ([41c47241](https://github.com/hyperium/hyper/commit/41c47241), closes [#1283](https://github.com/hyperium/hyper/issues/1283))
+* **http:**  log errors passed to tokio at debug level ([971864c4](https://github.com/hyperium/hyper/commit/971864c4), closes [#1278](https://github.com/hyperium/hyper/issues/1278))
+* **lib:**
+  *  Export hyper::RawStatus if the raw_status feature is enabled ([627c4e3d](https://github.com/hyperium/hyper/commit/627c4e3d))
+  *  remove logs that contain request and response data ([207fca63](https://github.com/hyperium/hyper/commit/207fca63), closes [#1281](https://github.com/hyperium/hyper/issues/1281))
+
+#### Performance
+
+* **server:**  try to read from socket at keep-alive ([1a9f2648](https://github.com/hyperium/hyper/commit/1a9f2648))
+
+
 ### v0.11.2 (2017-07-27)
 
 
@@ -585,7 +661,7 @@
 
 #### Bug Fixes
 
-* **cargo:** remove * dependendies for serde and env_logger ([4a05bee9](https://github.com/hyperium/hyper/commit/4a05bee9abdc426bbd904fe356b771e492dc8f43))
+* **cargo:** remove * dependencies for serde and env_logger ([4a05bee9](https://github.com/hyperium/hyper/commit/4a05bee9abdc426bbd904fe356b771e492dc8f43))
 * **server:**
   * Flush 100-continue messages ([92ff50f2](https://github.com/hyperium/hyper/commit/92ff50f2e57fa2cb8a55b3d6d9fa43ef9a1b5526), closes [#704](https://github.com/hyperium/hyper/issues/704))
   * Removed check for GET/HEAD request when parsing body ([0b05c590](https://github.com/hyperium/hyper/commit/0b05c5903e86327cc9cb4cac39217e496851fce3), closes [#698](https://github.com/hyperium/hyper/issues/698))
@@ -631,7 +707,7 @@
 #### Features
 
 * **headers:** Add Access-Control-Expose-Headers ([f783e991](https://github.com/hyperium/hyper/commit/f783e9913b988f3d5c28707e2291145999756dbe))
-* **server:** Add hooks for HttpListener and HttpsListener to be started from existing listene ([fa0848d4](https://github.com/hyperium/hyper/commit/fa0848d4216aa81e7b7619b7ce0a650356ee7ab7))
+* **server:** Add hooks for HttpListener and HttpsListener to be started from existing listener ([fa0848d4](https://github.com/hyperium/hyper/commit/fa0848d4216aa81e7b7619b7ce0a650356ee7ab7))
 
 
 #### Breaking Changes
@@ -699,7 +775,7 @@
 
 #### Bug Fixes
 
-* **client:** fix panics when some errors occured inside HttpMessage ([ef15257b](https://github.com/hyperium/hyper/commit/ef15257b733d40bc3a7c598f61918f91385585f9))
+* **client:** fix panics when some errors occurred inside HttpMessage ([ef15257b](https://github.com/hyperium/hyper/commit/ef15257b733d40bc3a7c598f61918f91385585f9))
 * **headers:** case insensitive values for Connection header ([341f8eae](https://github.com/hyperium/hyper/commit/341f8eae6eb33e2242be09541807cdad9afc732e), closes [#635](https://github.com/hyperium/hyper/issues/635))
 
 
@@ -951,7 +1027,7 @@ types changed.
 #### Bug Fixes
 
 * **client:**
-  * dont call close() inside Request ([3334fca2](https://github.com/hyperium/hyper/commit/3334fca278e662b2755e41045ce641238514bea9), closes [#519](https://github.com/hyperium/hyper/issues/519))
+  * don't call close() inside Request ([3334fca2](https://github.com/hyperium/hyper/commit/3334fca278e662b2755e41045ce641238514bea9), closes [#519](https://github.com/hyperium/hyper/issues/519))
   * keep the underlying connector when setting an SSL verifier ([f4556d55](https://github.com/hyperium/hyper/commit/f4556d554faa2a1170fec0af5b4076c31e7c3600), closes [#495](https://github.com/hyperium/hyper/issues/495))
 * **mock:** adjust ChannelMockConnector connect method to compile ([085d7b07](https://github.com/hyperium/hyper/commit/085d7b0752d7fc0134e99e9eec2a67cc66b319b3))
 
@@ -979,7 +1055,7 @@ types changed.
 
  ([62d96adc](https://github.com/hyperium/hyper/commit/62d96adc6b852b3836b47fc2e154bbdbab9ad7f6))
 * Any custom Connectors will need to change to &self in
-  the connect method. Any Connectors that needed the mutablity need to
+  the connect method. Any Connectors that needed the mutability need to
   figure out a synchronization strategy.
 
   Request::with_connector() takes a &NetworkConnector instead of &mut.

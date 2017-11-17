@@ -4,9 +4,10 @@ use futures::sync::mpsc;
 use tokio_proto;
 use std::borrow::Cow;
 
-use http::Chunk;
+use super::Chunk;
 
 pub type TokioBody = tokio_proto::streaming::Body<Chunk, ::Error>;
+pub type BodySender = mpsc::Sender<Result<Chunk, ::Error>>;
 
 /// A `Stream` for `Chunk`s used in requests and responses.
 #[must_use = "streams do nothing unless polled"]
@@ -46,6 +47,8 @@ impl Stream for Body {
     }
 }
 
+// deprecate soon, but can't really deprecate trait impls
+#[doc(hidden)]
 impl From<Body> for tokio_proto::streaming::Body<Chunk, ::Error> {
     #[inline]
     fn from(b: Body) -> tokio_proto::streaming::Body<Chunk, ::Error> {
@@ -53,6 +56,8 @@ impl From<Body> for tokio_proto::streaming::Body<Chunk, ::Error> {
     }
 }
 
+// deprecate soon, but can't really deprecate trait impls
+#[doc(hidden)]
 impl From<tokio_proto::streaming::Body<Chunk, ::Error>> for Body {
     #[inline]
     fn from(tokio_body: tokio_proto::streaming::Body<Chunk, ::Error>) -> Body {
@@ -98,10 +103,9 @@ impl From<&'static [u8]> for Body {
 impl From<Cow<'static, [u8]>> for Body {
     #[inline]
     fn from (cow: Cow<'static, [u8]>) -> Body {
-        if let Cow::Borrowed(value) = cow {
-            Body::from(value)
-        } else {
-            Body::from(cow.to_owned())
+        match cow {
+            Cow::Borrowed(b) => Body::from(b),
+            Cow::Owned(o) => Body::from(o)
         }
     }
 }
@@ -123,10 +127,9 @@ impl From<&'static str> for Body {
 impl From<Cow<'static, str>> for Body {
     #[inline]
     fn from(cow: Cow<'static, str>) -> Body {
-        if let Cow::Borrowed(value) = cow {
-            Body::from(value)
-        } else {
-            Body::from(cow.to_owned())
+        match cow {
+            Cow::Borrowed(b) => Body::from(b),
+            Cow::Owned(o) => Body::from(o)
         }
     }
 }

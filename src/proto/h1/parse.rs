@@ -5,9 +5,9 @@ use httparse;
 use bytes::{BytesMut, Bytes};
 
 use header::{self, Headers, ContentLength, TransferEncoding};
-use http::{MessageHead, RawStatus, Http1Transaction, ParseResult,
+use proto::{MessageHead, RawStatus, Http1Transaction, ParseResult,
            ServerTransaction, ClientTransaction, RequestLine, RequestHead};
-use http::h1::{Encoder, Decoder, date};
+use proto::h1::{Encoder, Decoder, date};
 use method::Method;
 use status::StatusCode;
 use version::HttpVersion::{Http10, Http11};
@@ -90,7 +90,7 @@ impl Http1Transaction for ServerTransaction {
             // https://tools.ietf.org/html/rfc7230#section-3.3.3
             // If Transfer-Encoding header is present, and 'chunked' is
             // not the final encoding, and this is a Request, then it is
-            // mal-formed. A server should responsed with 400 Bad Request.
+            // mal-formed. A server should respond with 400 Bad Request.
             if encodings.last() == Some(&header::Encoding::Chunked) {
                 Ok(Decoder::chunked())
             } else {
@@ -132,12 +132,20 @@ impl Http1Transaction for ServerTransaction {
         extend(dst, b"\r\n");
         body
     }
+
+    fn should_error_on_parse_eof() -> bool {
+        false
+    }
+
+    fn should_read_first() -> bool {
+        true
+    }
 }
 
 impl ServerTransaction {
     fn set_length(head: &mut MessageHead<StatusCode>, has_body: bool, method: Option<&Method>) -> Encoder {
         // these are here thanks to borrowck
-        // `if method == Some(&Method::Get)` says the RHS doesnt live long enough
+        // `if method == Some(&Method::Get)` says the RHS doesn't live long enough
         const HEAD: Option<&'static Method> = Some(&Method::Head);
         const CONNECT: Option<&'static Method> = Some(&Method::Connect);
 
@@ -281,6 +289,14 @@ impl Http1Transaction for ClientTransaction {
 
         body
     }
+
+    fn should_error_on_parse_eof() -> bool {
+        true
+    }
+
+    fn should_read_first() -> bool {
+        false
+    }
 }
 
 impl ClientTransaction {
@@ -381,7 +397,7 @@ fn extend(dst: &mut Vec<u8>, data: &[u8]) {
 mod tests {
     use bytes::BytesMut;
 
-    use http::{MessageHead, ServerTransaction, ClientTransaction, Http1Transaction};
+    use proto::{MessageHead, ServerTransaction, ClientTransaction, Http1Transaction};
     use header::{ContentLength, TransferEncoding};
 
     #[test]
@@ -438,7 +454,7 @@ mod tests {
         use super::Decoder;
 
         let method = &mut None;
-        let mut head = MessageHead::<::http::RequestLine>::default();
+        let mut head = MessageHead::<::proto::RequestLine>::default();
 
         head.subject.0 = ::Method::Get;
         assert_eq!(Decoder::length(0), ServerTransaction::decoder(&head, method).unwrap());
@@ -474,7 +490,7 @@ mod tests {
         use super::Decoder;
 
         let method = &mut Some(::Method::Get);
-        let mut head = MessageHead::<::http::RawStatus>::default();
+        let mut head = MessageHead::<::proto::RawStatus>::default();
 
         head.subject.0 = 204;
         assert_eq!(Decoder::length(0), ClientTransaction::decoder(&head, method).unwrap());

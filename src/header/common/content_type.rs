@@ -17,15 +17,18 @@ header! {
     /// this is an issue, it's possible to implement `Header` on a custom struct.
     ///
     /// # ABNF
-    /// ```plain
+    ///
+    /// ```text
     /// Content-Type = media-type
     /// ```
     ///
     /// # Example values
+    ///
     /// * `text/html; charset=utf-8`
     /// * `application/json`
     ///
     /// # Examples
+    ///
     /// ```
     /// use hyper::header::{Headers, ContentType};
     ///
@@ -35,6 +38,7 @@ header! {
     ///     ContentType::json()
     /// );
     /// ```
+    ///
     /// ```
     /// use hyper::header::{Headers, ContentType};
     /// use hyper::mime;
@@ -68,10 +72,16 @@ impl ContentType {
         ContentType(mime::TEXT_PLAIN_UTF_8)
     }
 
-    /// A constructor  to easily create a `Content-Type: text/html; charset=utf-8` header.
+    /// A constructor  to easily create a `Content-Type: text/html` header.
     #[inline]
     pub fn html() -> ContentType {
         ContentType(mime::TEXT_HTML)
+    }
+
+    /// A constructor  to easily create a `Content-Type: text/xml` header.
+    #[inline]
+    pub fn xml() -> ContentType {
+        ContentType(mime::TEXT_XML)
     }
 
     /// A constructor  to easily create a `Content-Type: application/www-form-url-encoded` header.

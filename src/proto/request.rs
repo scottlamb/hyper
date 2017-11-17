@@ -1,11 +1,16 @@
 use std::fmt;
+#[cfg(feature = "compat")]
+use std::mem::replace;
+use std::net::SocketAddr;
+
+#[cfg(feature = "compat")]
+use http;
 
 use header::Headers;
-use http::{Body, MessageHead, RequestHead, RequestLine};
+use proto::{Body, MessageHead, RequestHead, RequestLine};
 use method::Method;
 use uri::{self, Uri};
 use version::HttpVersion;
-use std::net::SocketAddr;
 
 /// An HTTP Request
 pub struct Request<B = Body> {
@@ -132,17 +137,47 @@ impl<B> fmt::Debug for Request<B> {
     }
 }
 
+#[cfg(feature = "compat")]
+impl From<Request> for http::Request<Body> {
+    fn from(from_req: Request) -> http::Request<Body> {
+        let (m, u, v, h, b) = from_req.deconstruct();
+
+        let to_req = http::Request::new(());
+        let (mut to_parts, _) = to_req.into_parts();
+
+        to_parts.method = m.into();
+        to_parts.uri = u.into();
+        to_parts.version = v.into();
+        to_parts.headers = h.into();
+
+        http::Request::from_parts(to_parts, b)
+    }
+}
+
+#[cfg(feature = "compat")]
+impl<B> From<http::Request<B>> for Request<B> {
+    fn from(from_req: http::Request<B>) -> Request<B> {
+        let (from_parts, body) = from_req.into_parts();
+
+        let mut to_req = Request::new(from_parts.method.into(), from_parts.uri.into());
+        to_req.set_version(from_parts.version.into());
+        replace(to_req.headers_mut(), from_parts.headers.into());
+        to_req.set_body(body);
+        to_req
+    }
+}
+
 /// Constructs a request using a received ResponseHead and optional body
-pub fn from_wire<B>(addr: Option<SocketAddr>, incoming: RequestHead, body: B) -> Request<B> {
+pub fn from_wire(addr: Option<SocketAddr>, incoming: RequestHead, body: Option<Body>) -> Request<Body> {
     let MessageHead { version, subject: RequestLine(method, uri), headers } = incoming;
 
-    Request::<B> {
+    Request {
         method: method,
         uri: uri,
         headers: headers,
         version: version,
         remote_addr: addr,
-        body: Some(body),
+        body: body,
         is_proxy: false,
     }
 }
@@ -154,7 +189,7 @@ pub fn split<B>(req: Request<B>) -> (RequestHead, Option<B>) {
         uri::origin_form(&req.uri)
     };
     let head = RequestHead {
-        subject: ::http::RequestLine(req.method, uri),
+        subject: ::proto::RequestLine(req.method, uri),
         headers: req.headers,
         version: req.version,
     };

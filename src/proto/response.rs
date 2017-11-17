@@ -1,7 +1,12 @@
 use std::fmt;
+#[cfg(feature = "compat")]
+use std::mem::replace;
+
+#[cfg(feature = "compat")]
+use http;
 
 use header::{Header, Headers};
-use http::{MessageHead, ResponseHead, Body};
+use proto::{MessageHead, ResponseHead, Body};
 use status::StatusCode;
 use version::HttpVersion;
 
@@ -11,7 +16,7 @@ pub struct Response<B = Body> {
     headers: Headers,
     status: StatusCode,
     #[cfg(feature = "raw_status")]
-    raw_status: ::http::RawStatus,
+    raw_status: ::proto::RawStatus,
     body: Option<B>,
 }
 
@@ -44,7 +49,7 @@ impl<B> Response<B> {
     /// a received response.
     #[inline]
     #[cfg(feature = "raw_status")]
-    pub fn status_raw(&self) -> &::http::RawStatus { &self.raw_status }
+    pub fn status_raw(&self) -> &::proto::RawStatus { &self.raw_status }
 
     /// Set the `StatusCode` for this response.
     #[inline]
@@ -142,6 +147,30 @@ impl fmt::Debug for Response {
     }
 }
 
+#[cfg(feature = "compat")]
+impl<B> From<http::Response<B>> for Response<B> {
+    fn from(from_res: http::Response<B>) -> Response<B> {
+        let (from_parts, body) = from_res.into_parts();
+        let mut to_res = Response::new();
+        to_res.version = from_parts.version.into();
+        to_res.set_status(from_parts.status.into());
+        replace(to_res.headers_mut(), from_parts.headers.into());
+        to_res.with_body(body)
+    }
+}
+
+#[cfg(feature = "compat")]
+impl From<Response> for http::Response<Body> {
+    fn from(mut from_res: Response) -> http::Response<Body> {
+        let (mut to_parts, ()) = http::Response::new(()).into_parts();
+        to_parts.version = from_res.version().into();
+        to_parts.status = from_res.status().into();
+        let from_headers = replace(from_res.headers_mut(), Headers::new());
+        to_parts.headers = from_headers.into();
+        http::Response::from_parts(to_parts, from_res.body())
+    }
+}
+
 /// Constructs a response using a received ResponseHead and optional body
 #[inline]
 #[cfg(not(feature = "raw_status"))]
@@ -171,7 +200,7 @@ pub fn from_wire<B>(incoming: ResponseHead, body: Option<B>) -> Response<B> {
     }
 }
 
-/// Splits this response into a MessageHead<StatusCode> and its body
+/// Splits this response into a `MessageHead<StatusCode>` and its body
 #[inline]
 pub fn split<B>(res: Response<B>) -> (MessageHead<StatusCode>, Option<B>) {
     let head = MessageHead::<StatusCode> {

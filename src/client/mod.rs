@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use futures::{future, Poll, Async, Future, Stream};
 use futures::unsync::oneshot;
+#[cfg(feature = "compat")]
+use http;
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio::reactor::Handle;
 use tokio_proto::BindClient;
@@ -18,39 +20,43 @@ use tokio_proto::util::client_proxy::ClientProxy;
 pub use tokio_service::Service;
 
 use header::{Headers, Host};
-use http::{self, TokioBody};
-use http::response;
-use http::request;
+use proto::{self, RequestHead, TokioBody};
+use proto::response;
+use proto::request;
 use method::Method;
 use self::pool::{Pool, Pooled};
 use uri::{self, Uri};
 use version::HttpVersion;
 
-pub use http::response::Response;
-pub use http::request::Request;
+pub use proto::response::Response;
+pub use proto::request::Request;
 pub use self::connect::{HttpConnector, Connect};
 
 mod connect;
 mod dns;
 mod pool;
+#[cfg(feature = "compat")]
+mod compat_impl;
+#[cfg(feature = "compat")]
+pub mod compat;
 
 /// A Client to make outgoing HTTP requests.
 // If the Connector is clone, then the Client can be clone easily.
-pub struct Client<C, B = http::Body> {
+pub struct Client<C, B = proto::Body> {
     connector: C,
     handle: Handle,
-    pool: Pool<TokioClient<B>>,
+    pool: Dispatch<B>,
 }
 
-impl Client<HttpConnector, http::Body> {
+impl Client<HttpConnector, proto::Body> {
     /// Create a new Client with the default config.
     #[inline]
-    pub fn new(handle: &Handle) -> Client<HttpConnector, http::Body> {
+    pub fn new(handle: &Handle) -> Client<HttpConnector, proto::Body> {
         Config::default().build(handle)
     }
 }
 
-impl Client<HttpConnector, http::Body> {
+impl Client<HttpConnector, proto::Body> {
     /// Configure a Client.
     ///
     /// # Example
@@ -69,7 +75,7 @@ impl Client<HttpConnector, http::Body> {
     /// # }
     /// ```
     #[inline]
-    pub fn configure() -> Config<UseDefaultConnector, http::Body> {
+    pub fn configure() -> Config<UseDefaultConnector, proto::Body> {
         Config::default()
     }
 }
@@ -87,7 +93,11 @@ impl<C, B> Client<C, B> {
         Client {
             connector: config.connector,
             handle: handle.clone(),
-            pool: Pool::new(config.keep_alive, config.keep_alive_timeout),
+            pool: if config.no_proto {
+                Dispatch::Hyper(Pool::new(config.keep_alive, config.keep_alive_timeout))
+            } else {
+                Dispatch::Proto(Pool::new(config.keep_alive, config.keep_alive_timeout))
+            }
         }
     }
 }
@@ -107,6 +117,19 @@ where C: Connect,
     #[inline]
     pub fn request(&self, req: Request<B>) -> FutureResponse {
         self.call(req)
+    }
+
+    /// Send an `http::Request` using this Client.
+    #[inline]
+    #[cfg(feature = "compat")]
+    pub fn request_compat(&self, req: http::Request<B>) -> compat::CompatFutureResponse {
+        self::compat_impl::future(self.call(req.into()))
+    }
+
+    /// Convert into a client accepting `http::Request`.
+    #[cfg(feature = "compat")]
+    pub fn into_compat(self) -> compat::CompatClient<C, B> {
+        self::compat_impl::client(self)
     }
 }
 
@@ -168,48 +191,100 @@ where C: Connect,
         headers.extend(head.headers.iter());
         head.headers = headers;
 
-        let checkout = self.pool.checkout(domain.as_ref());
-        let connect = {
-            let handle = self.handle.clone();
-            let pool = self.pool.clone();
-            let pool_key = Rc::new(domain.to_string());
-            self.connector.connect(url)
-                .map(move |io| {
-                    let (tx, rx) = oneshot::channel();
-                    let client = HttpClient {
-                        client_rx: RefCell::new(Some(rx)),
-                    }.bind_client(&handle, io);
-                    let pooled = pool.pooled(pool_key, client);
-                    drop(tx.send(pooled.clone()));
-                    pooled
-                })
-        };
+        match self.pool {
+            Dispatch::Proto(ref pool) => {
+                trace!("proto_dispatch");
+                let checkout = pool.checkout(domain.as_ref());
+                let connect = {
+                    let handle = self.handle.clone();
+                    let pool = pool.clone();
+                    let pool_key = Rc::new(domain.to_string());
+                    self.connector.connect(url)
+                        .map(move |io| {
+                            let (tx, rx) = oneshot::channel();
+                            let client = HttpClient {
+                                client_rx: RefCell::new(Some(rx)),
+                            }.bind_client(&handle, io);
+                            let pooled = pool.pooled(pool_key, client);
+                            drop(tx.send(pooled.clone()));
+                            pooled
+                        })
+                };
 
-        let race = checkout.select(connect)
-            .map(|(client, _work)| client)
-            .map_err(|(e, _work)| {
-                // the Pool Checkout cannot error, so the only error
-                // is from the Connector
-                // XXX: should wait on the Checkout? Problem is
-                // that if the connector is failing, it may be that we
-                // never had a pooled stream at all
-                e.into()
-            });
-        let resp = race.and_then(move |client| {
-            let msg = match body {
-                Some(body) => {
-                    Message::WithBody(head, body.into())
-                },
-                None => Message::WithoutBody(head),
-            };
-            client.call(msg)
-        });
-        FutureResponse(Box::new(resp.map(|msg| {
-            match msg {
-                Message::WithoutBody(head) => response::from_wire(head, None),
-                Message::WithBody(head, body) => response::from_wire(head, Some(body.into())),
+                let race = checkout.select(connect)
+                    .map(|(client, _work)| client)
+                    .map_err(|(e, _work)| {
+                        // the Pool Checkout cannot error, so the only error
+                        // is from the Connector
+                        // XXX: should wait on the Checkout? Problem is
+                        // that if the connector is failing, it may be that we
+                        // never had a pooled stream at all
+                        e.into()
+                    });
+                let resp = race.and_then(move |client| {
+                    let msg = match body {
+                        Some(body) => {
+                            Message::WithBody(head, body.into())
+                        },
+                        None => Message::WithoutBody(head),
+                    };
+                    client.call(msg)
+                });
+                FutureResponse(Box::new(resp.map(|msg| {
+                    match msg {
+                        Message::WithoutBody(head) => response::from_wire(head, None),
+                        Message::WithBody(head, body) => response::from_wire(head, Some(body.into())),
+                    }
+                })))
+            },
+            Dispatch::Hyper(ref pool) => {
+                trace!("no_proto dispatch");
+                use futures::Sink;
+                use futures::sync::{mpsc, oneshot};
+
+                let checkout = pool.checkout(domain.as_ref());
+                let connect = {
+                    let handle = self.handle.clone();
+                    let pool = pool.clone();
+                    let pool_key = Rc::new(domain.to_string());
+                    self.connector.connect(url)
+                        .map(move |io| {
+                            let (tx, rx) = mpsc::channel(1);
+                            let pooled = pool.pooled(pool_key, RefCell::new(tx));
+                            let conn = proto::Conn::<_, _, proto::ClientTransaction, _>::new(io, pooled.clone());
+                            let dispatch = proto::dispatch::Dispatcher::new(proto::dispatch::Client::new(rx), conn);
+                            handle.spawn(dispatch.map_err(|err| error!("no_proto error: {}", err)));
+                            pooled
+                        })
+                };
+
+                let race = checkout.select(connect)
+                    .map(|(client, _work)| client)
+                    .map_err(|(e, _work)| {
+                        // the Pool Checkout cannot error, so the only error
+                        // is from the Connector
+                        // XXX: should wait on the Checkout? Problem is
+                        // that if the connector is failing, it may be that we
+                        // never had a pooled stream at all
+                        e.into()
+                    });
+
+                let resp = race.and_then(move |client| {
+                    let (callback, rx) = oneshot::channel();
+                    client.borrow_mut().start_send((head, body, callback)).unwrap();
+                    rx.then(|res| {
+                        match res {
+                            Ok(Ok(res)) => Ok(res),
+                            Ok(Err(err)) => Err(err),
+                            Err(_) => panic!("dispatch dropped without returning error"),
+                        }
+                    })
+                });
+
+                FutureResponse(Box::new(resp))
+
             }
-        })))
+        }
     }
 
 }
@@ -219,7 +294,10 @@ impl<C: Clone, B> Clone for Client<C, B> {
         Client {
             connector: self.connector.clone(),
             handle: self.handle.clone(),
-            pool: self.pool.clone(),
+            pool: match self.pool {
+                Dispatch::Proto(ref pool) => Dispatch::Proto(pool.clone()),
+                Dispatch::Hyper(ref pool) => Dispatch::Hyper(pool.clone()),
+            }
         }
     }
 }
@@ -230,10 +308,16 @@ impl<C, B> fmt::Debug for Client<C, B> {
     }
 }
 
-type TokioClient<B> = ClientProxy<Message<http::RequestHead, B>, Message<http::ResponseHead, TokioBody>, ::Error>;
+type ProtoClient<B> = ClientProxy<Message<RequestHead, B>, Message<proto::ResponseHead, TokioBody>, ::Error>;
+type HyperClient<B> = RefCell<::futures::sync::mpsc::Sender<(RequestHead, Option<B>, ::futures::sync::oneshot::Sender<::Result<::Response>>)>>;
+
+enum Dispatch<B> {
+    Proto(Pool<ProtoClient<B>>),
+    Hyper(Pool<HyperClient<B>>),
+}
 
 struct HttpClient<B> {
-    client_rx: RefCell<Option<oneshot::Receiver<Pooled<TokioClient<B>>>>>,
+    client_rx: RefCell<Option<oneshot::Receiver<Pooled<ProtoClient<B>>>>>,
 }
 
 impl<T, B> ClientProto<T> for HttpClient<B>
@@ -241,12 +325,12 @@ where T: AsyncRead + AsyncWrite + 'static,
       B: Stream<Error=::Error> + 'static,
       B::Item: AsRef<[u8]>,
 {
-    type Request = http::RequestHead;
+    type Request = proto::RequestHead;
     type RequestBody = B::Item;
-    type Response = http::ResponseHead;
-    type ResponseBody = http::Chunk;
+    type Response = proto::ResponseHead;
+    type ResponseBody = proto::Chunk;
     type Error = ::Error;
-    type Transport = http::Conn<T, B::Item, http::ClientTransaction, Pooled<TokioClient<B>>>;
+    type Transport = proto::Conn<T, B::Item, proto::ClientTransaction, Pooled<ProtoClient<B>>>;
     type BindTransport = BindingClient<T, B>;
 
     fn bind_transport(&self, io: T) -> Self::BindTransport {
@@ -258,7 +342,7 @@ where T: AsyncRead + AsyncWrite + 'static,
 }
 
 struct BindingClient<T, B> {
-    rx: oneshot::Receiver<Pooled<TokioClient<B>>>,
+    rx: oneshot::Receiver<Pooled<ProtoClient<B>>>,
     io: Option<T>,
 }
 
@@ -267,13 +351,13 @@ where T: AsyncRead + AsyncWrite + 'static,
       B: Stream<Error=::Error>,
       B::Item: AsRef<[u8]>,
 {
-    type Item = http::Conn<T, B::Item, http::ClientTransaction, Pooled<TokioClient<B>>>;
+    type Item = proto::Conn<T, B::Item, proto::ClientTransaction, Pooled<ProtoClient<B>>>;
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         match self.rx.poll() {
             Ok(Async::Ready(client)) => Ok(Async::Ready(
-                    http::Conn::new(self.io.take().expect("binding client io lost"), client)
+                    proto::Conn::new(self.io.take().expect("binding client io lost"), client)
             )),
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Err(_canceled) => unreachable!(),
@@ -290,21 +374,23 @@ pub struct Config<C, B> {
     keep_alive_timeout: Option<Duration>,
     //TODO: make use of max_idle config
     max_idle: usize,
+    no_proto: bool,
 }
 
 /// Phantom type used to signal that `Config` should create a `HttpConnector`.
 #[derive(Debug, Clone, Copy)]
 pub struct UseDefaultConnector(());
 
-impl Default for Config<UseDefaultConnector, http::Body> {
-    fn default() -> Config<UseDefaultConnector, http::Body> {
+impl Default for Config<UseDefaultConnector, proto::Body> {
+    fn default() -> Config<UseDefaultConnector, proto::Body> {
         Config {
-            _body_type: PhantomData::<http::Body>,
+            _body_type: PhantomData::<proto::Body>,
             //connect_timeout: Duration::from_secs(10),
             connector: UseDefaultConnector(()),
             keep_alive: true,
             keep_alive_timeout: Some(Duration::from_secs(90)),
             max_idle: 5,
+            no_proto: false,
         }
     }
 }
@@ -328,6 +414,7 @@ impl<C, B> Config<C, B> {
             keep_alive: self.keep_alive,
             keep_alive_timeout: self.keep_alive_timeout,
             max_idle: self.max_idle,
+            no_proto: self.no_proto,
         }
     }
 
@@ -341,6 +428,7 @@ impl<C, B> Config<C, B> {
             keep_alive: self.keep_alive,
             keep_alive_timeout: self.keep_alive_timeout,
             max_idle: self.max_idle,
+            no_proto: self.no_proto,
         }
     }
 
@@ -374,6 +462,13 @@ impl<C, B> Config<C, B> {
         self
     }
     */
+
+    /// Disable tokio-proto internal usage.
+    #[inline]
+    pub fn no_proto(mut self) -> Config<C, B> {
+        self.no_proto = true;
+        self
+    }
 }
 
 impl<C, B> Config<C, B>
@@ -412,49 +507,8 @@ impl<C, B> fmt::Debug for Config<C, B> {
 impl<C: Clone, B> Clone for Config<C, B> {
     fn clone(&self) -> Config<C, B> {
         Config {
-            _body_type: PhantomData::<B>,
             connector: self.connector.clone(),
-            keep_alive: self.keep_alive,
-            keep_alive_timeout: self.keep_alive_timeout,
-            max_idle: self.max_idle,
+            .. *self
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    /*
-    use std::io::Read;
-    use header::Server;
-    use super::{Client};
-    use super::pool::Pool;
-    use Url;
-
-    mock_connector!(Issue640Connector {
-        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n",
-        b"GET",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n",
-        b"HEAD",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n",
-        b"POST"
-    });
-
-    // see issue #640
-    #[test]
-    fn test_head_response_body_keep_alive() {
-        let client = Client::with_connector(Pool::with_connector(Default::default(), Issue640Connector));
-
-        let mut s = String::new();
-        client.get("http://127.0.0.1").send().unwrap().read_to_string(&mut s).unwrap();
-        assert_eq!(s, "GET");
-
-        let mut s = String::new();
-        client.head("http://127.0.0.1").send().unwrap().read_to_string(&mut s).unwrap();
-        assert_eq!(s, "");
-
-        let mut s = String::new();
-        client.post("http://127.0.0.1").send().unwrap().read_to_string(&mut s).unwrap();
-        assert_eq!(s, "POST");
-    }
-    */
 }
