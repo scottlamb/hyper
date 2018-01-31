@@ -12,15 +12,14 @@ use uri::Uri;
 use version::HttpVersion;
 use version::HttpVersion::{Http10, Http11};
 
-pub use self::conn::{Conn, KeepAlive, KA};
-pub use self::body::{Body, TokioBody};
+pub use self::body::Body;
+#[cfg(feature = "tokio-proto")]
+pub use self::body::TokioBody;
 pub use self::chunk::Chunk;
+pub use self::h1::{dispatch, Conn, KeepAlive, KA};
 
 mod body;
 mod chunk;
-mod conn;
-pub mod dispatch;
-mod io;
 mod h1;
 //mod h2;
 pub mod request;
@@ -145,8 +144,9 @@ pub trait Http1Transaction {
     type Incoming;
     type Outgoing: Default;
     fn parse(bytes: &mut BytesMut) -> ParseResult<Self::Incoming>;
-    fn decoder(head: &MessageHead<Self::Incoming>, method: &mut Option<::Method>) -> ::Result<h1::Decoder>;
-    fn encode(head: MessageHead<Self::Outgoing>, has_body: bool, method: &mut Option<Method>, dst: &mut Vec<u8>) -> h1::Encoder;
+    fn decoder(head: &MessageHead<Self::Incoming>, method: &mut Option<::Method>) -> ::Result<Option<h1::Decoder>>;
+    fn encode(head: MessageHead<Self::Outgoing>, has_body: bool, method: &mut Option<Method>, dst: &mut Vec<u8>) -> ::Result<h1::Encoder>;
+    fn on_error(err: &::Error) -> Option<MessageHead<Self::Outgoing>>;
 
     fn should_error_on_parse_eof() -> bool;
     fn should_read_first() -> bool;

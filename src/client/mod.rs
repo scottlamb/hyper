@@ -1,30 +1,24 @@
 //! HTTP Client
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::time::Duration;
 
-use futures::{future, Poll, Async, Future, Stream};
-use futures::unsync::oneshot;
+use futures::{Future, Poll, Stream};
+use futures::future::{self, Executor};
 #[cfg(feature = "compat")]
 use http;
-use tokio_io::{AsyncRead, AsyncWrite};
 use tokio::reactor::Handle;
-use tokio_proto::BindClient;
-use tokio_proto::streaming::Message;
-use tokio_proto::streaming::pipeline::ClientProto;
-use tokio_proto::util::client_proxy::ClientProxy;
 pub use tokio_service::Service;
 
-use header::{Headers, Host};
-use proto::{self, RequestHead, TokioBody};
-use proto::response;
+use header::{Host};
+use proto;
 use proto::request;
 use method::Method;
-use self::pool::{Pool, Pooled};
+use self::pool::Pool;
 use uri::{self, Uri};
 use version::HttpVersion;
 
@@ -32,11 +26,11 @@ pub use proto::response::Response;
 pub use proto::request::Request;
 pub use self::connect::{HttpConnector, Connect};
 
+use self::background::{bg, Background};
+
 mod connect;
 mod dns;
 mod pool;
-#[cfg(feature = "compat")]
-mod compat_impl;
 #[cfg(feature = "compat")]
 pub mod compat;
 
@@ -44,8 +38,8 @@ pub mod compat;
 // If the Connector is clone, then the Client can be clone easily.
 pub struct Client<C, B = proto::Body> {
     connector: C,
-    handle: Handle,
-    pool: Dispatch<B>,
+    executor: Exec,
+    pool: Pool<HyperClient<B>>,
 }
 
 impl Client<HttpConnector, proto::Body> {
@@ -81,23 +75,25 @@ impl Client<HttpConnector, proto::Body> {
 }
 
 impl<C, B> Client<C, B> {
-    /// Return a reference to a handle to the event loop this Client is associated with.
-    #[inline]
+    // Eventually, a Client won't really care about a tokio Handle, and only
+    // the executor used to spawn background tasks. Removing this method is
+    // a breaking change, so for now, it's just deprecated.
+    #[doc(hidden)]
+    #[deprecated]
     pub fn handle(&self) -> &Handle {
-        &self.handle
+        match self.executor {
+            Exec::Handle(ref h) => h,
+            Exec::Executor(..) => panic!("Client not built with a Handle"),
+        }
     }
 
     /// Create a new client with a specific connector.
     #[inline]
-    fn configured(config: Config<C, B>, handle: &Handle) -> Client<C, B> {
+    fn configured(config: Config<C, B>, exec: Exec) -> Client<C, B> {
         Client {
             connector: config.connector,
-            handle: handle.clone(),
-            pool: if config.no_proto {
-                Dispatch::Hyper(Pool::new(config.keep_alive, config.keep_alive_timeout))
-            } else {
-                Dispatch::Proto(Pool::new(config.keep_alive, config.keep_alive_timeout))
-            }
+            executor: exec,
+            pool: Pool::new(config.keep_alive, config.keep_alive_timeout)
         }
     }
 }
@@ -123,13 +119,13 @@ where C: Connect,
     #[inline]
     #[cfg(feature = "compat")]
     pub fn request_compat(&self, req: http::Request<B>) -> compat::CompatFutureResponse {
-        self::compat_impl::future(self.call(req.into()))
+        self::compat::future(self.call(req.into()))
     }
 
     /// Convert into a client accepting `http::Request`.
     #[cfg(feature = "compat")]
     pub fn into_compat(self) -> compat::CompatClient<C, B> {
-        self::compat_impl::client(self)
+        self::compat::client(self)
     }
 }
 
@@ -184,107 +180,81 @@ where C: Connect,
                 ))));
             }
         };
-        let host = Host::new(domain.host().expect("authority implies host").to_owned(), domain.port());
         let (mut head, body) = request::split(req);
-        let mut headers = Headers::new();
-        headers.set(host);
-        headers.extend(head.headers.iter());
-        head.headers = headers;
-
-        match self.pool {
-            Dispatch::Proto(ref pool) => {
-                trace!("proto_dispatch");
-                let checkout = pool.checkout(domain.as_ref());
-                let connect = {
-                    let handle = self.handle.clone();
-                    let pool = pool.clone();
-                    let pool_key = Rc::new(domain.to_string());
-                    self.connector.connect(url)
-                        .map(move |io| {
-                            let (tx, rx) = oneshot::channel();
-                            let client = HttpClient {
-                                client_rx: RefCell::new(Some(rx)),
-                            }.bind_client(&handle, io);
-                            let pooled = pool.pooled(pool_key, client);
-                            drop(tx.send(pooled.clone()));
-                            pooled
-                        })
-                };
-
-                let race = checkout.select(connect)
-                    .map(|(client, _work)| client)
-                    .map_err(|(e, _work)| {
-                        // the Pool Checkout cannot error, so the only error
-                        // is from the Connector
-                        // XXX: should wait on the Checkout? Problem is
-                        // that if the connector is failing, it may be that we
-                        // never had a pooled stream at all
-                        e.into()
-                    });
-                let resp = race.and_then(move |client| {
-                    let msg = match body {
-                        Some(body) => {
-                            Message::WithBody(head, body.into())
-                        },
-                        None => Message::WithoutBody(head),
-                    };
-                    client.call(msg)
-                });
-                FutureResponse(Box::new(resp.map(|msg| {
-                    match msg {
-                        Message::WithoutBody(head) => response::from_wire(head, None),
-                        Message::WithBody(head, body) => response::from_wire(head, Some(body.into())),
-                    }
-                })))
-            },
-            Dispatch::Hyper(ref pool) => {
-                trace!("no_proto dispatch");
-                use futures::Sink;
-                use futures::sync::{mpsc, oneshot};
-
-                let checkout = pool.checkout(domain.as_ref());
-                let connect = {
-                    let handle = self.handle.clone();
-                    let pool = pool.clone();
-                    let pool_key = Rc::new(domain.to_string());
-                    self.connector.connect(url)
-                        .map(move |io| {
-                            let (tx, rx) = mpsc::channel(1);
-                            let pooled = pool.pooled(pool_key, RefCell::new(tx));
-                            let conn = proto::Conn::<_, _, proto::ClientTransaction, _>::new(io, pooled.clone());
-                            let dispatch = proto::dispatch::Dispatcher::new(proto::dispatch::Client::new(rx), conn);
-                            handle.spawn(dispatch.map_err(|err| error!("no_proto error: {}", err)));
-                            pooled
-                        })
-                };
-
-                let race = checkout.select(connect)
-                    .map(|(client, _work)| client)
-                    .map_err(|(e, _work)| {
-                        // the Pool Checkout cannot error, so the only error
-                        // is from the Connector
-                        // XXX: should wait on the Checkout? Problem is
-                        // that if the connector is failing, it may be that we
-                        // never had a pooled stream at all
-                        e.into()
-                    });
-
-                let resp = race.and_then(move |client| {
-                    let (callback, rx) = oneshot::channel();
-                    client.borrow_mut().start_send((head, body, callback)).unwrap();
-                    rx.then(|res| {
-                        match res {
-                            Ok(Ok(res)) => Ok(res),
-                            Ok(Err(err)) => Err(err),
-                            Err(_) => panic!("dispatch dropped without returning error"),
-                        }
-                    })
-                });
-
-                FutureResponse(Box::new(resp))
-
-            }
+        if !head.headers.has::<Host>() {
+            let host = Host::new(
+                domain.host().expect("authority implies host").to_owned(),
+                domain.port(),
+            );
+            head.headers.set_pos(0, host);
         }
+
+        use futures::Sink;
+        use futures::sync::{mpsc, oneshot};
+
+        let checkout = self.pool.checkout(domain.as_ref());
+        let connect = {
+            let executor = self.executor.clone();
+            let pool = self.pool.clone();
+            let pool_key = Rc::new(domain.to_string());
+            self.connector.connect(url)
+                .and_then(move |io| {
+                    // 1 extra slot for possible Close message
+                    let (tx, rx) = mpsc::channel(1);
+                    let tx = HyperClient {
+                        tx: RefCell::new(tx),
+                        should_close: Cell::new(true),
+                    };
+                    let pooled = pool.pooled(pool_key, tx);
+                    let conn = proto::Conn::<_, _, proto::ClientTransaction, _>::new(io, pooled.clone());
+                    let dispatch = proto::dispatch::Dispatcher::new(proto::dispatch::Client::new(rx), conn);
+                    executor.execute(dispatch.map_err(|e| debug!("client connection error: {}", e)))?;
+                    Ok(pooled)
+                })
+        };
+
+        let race = checkout.select(connect)
+            .map(|(client, _work)| client)
+            .map_err(|(e, _work)| {
+                // the Pool Checkout cannot error, so the only error
+                // is from the Connector
+                // XXX: should wait on the Checkout? Problem is
+                // that if the connector is failing, it may be that we
+                // never had a pooled stream at all
+                e.into()
+            });
+
+        let resp = race.and_then(move |client| {
+            use proto::dispatch::ClientMsg;
+
+            let (callback, rx) = oneshot::channel();
+            client.should_close.set(false);
+
+            match client.tx.borrow_mut().start_send(ClientMsg::Request(head, body, callback)) {
+                Ok(_) => (),
+                Err(e) => match e.into_inner() {
+                    ClientMsg::Request(_, _, callback) => {
+                        error!("pooled connection was not ready, this is a hyper bug");
+                        let err = io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "pool selected dead connection",
+                        );
+                        let _ = callback.send(Err(::Error::Io(err)));
+                    },
+                    _ => unreachable!("ClientMsg::Request was just sent"),
+                }
+            }
+
+            rx.then(|res| {
+                match res {
+                    Ok(Ok(res)) => Ok(res),
+                    Ok(Err(err)) => Err(err),
+                    Err(_) => panic!("dispatch dropped without returning error"),
+                }
+            })
+        });
+
+        FutureResponse(Box::new(resp))
     }
 
 }
@@ -293,11 +263,8 @@ impl<C: Clone, B> Clone for Client<C, B> {
     fn clone(&self) -> Client<C, B> {
         Client {
             connector: self.connector.clone(),
-            handle: self.handle.clone(),
-            pool: match self.pool {
-                Dispatch::Proto(ref pool) => Dispatch::Proto(pool.clone()),
-                Dispatch::Hyper(ref pool) => Dispatch::Hyper(pool.clone()),
-            }
+            executor: self.executor.clone(),
+            pool: self.pool.clone(),
         }
     }
 }
@@ -308,59 +275,39 @@ impl<C, B> fmt::Debug for Client<C, B> {
     }
 }
 
-type ProtoClient<B> = ClientProxy<Message<RequestHead, B>, Message<proto::ResponseHead, TokioBody>, ::Error>;
-type HyperClient<B> = RefCell<::futures::sync::mpsc::Sender<(RequestHead, Option<B>, ::futures::sync::oneshot::Sender<::Result<::Response>>)>>;
-
-enum Dispatch<B> {
-    Proto(Pool<ProtoClient<B>>),
-    Hyper(Pool<HyperClient<B>>),
+struct HyperClient<B> {
+    // A sentinel that is usually always true. If this is dropped
+    // while true, this will try to shutdown the dispatcher task.
+    //
+    // This should be set to false whenever it is checked out of the
+    // pool and successfully used to send a request.
+    should_close: Cell<bool>,
+    tx: RefCell<::futures::sync::mpsc::Sender<proto::dispatch::ClientMsg<B>>>,
 }
 
-struct HttpClient<B> {
-    client_rx: RefCell<Option<oneshot::Receiver<Pooled<ProtoClient<B>>>>>,
-}
-
-impl<T, B> ClientProto<T> for HttpClient<B>
-where T: AsyncRead + AsyncWrite + 'static,
-      B: Stream<Error=::Error> + 'static,
-      B::Item: AsRef<[u8]>,
-{
-    type Request = proto::RequestHead;
-    type RequestBody = B::Item;
-    type Response = proto::ResponseHead;
-    type ResponseBody = proto::Chunk;
-    type Error = ::Error;
-    type Transport = proto::Conn<T, B::Item, proto::ClientTransaction, Pooled<ProtoClient<B>>>;
-    type BindTransport = BindingClient<T, B>;
-
-    fn bind_transport(&self, io: T) -> Self::BindTransport {
-        BindingClient {
-            rx: self.client_rx.borrow_mut().take().expect("client_rx was lost"),
-            io: Some(io),
+impl<B> Clone for HyperClient<B> {
+    fn clone(&self) -> HyperClient<B> {
+        HyperClient {
+            tx: self.tx.clone(),
+            should_close: self.should_close.clone(),
         }
     }
 }
 
-struct BindingClient<T, B> {
-    rx: oneshot::Receiver<Pooled<ProtoClient<B>>>,
-    io: Option<T>,
+impl<B> self::pool::Ready for HyperClient<B> {
+    fn poll_ready(&mut self) -> Poll<(), ()> {
+        self.tx
+            .borrow_mut()
+            .poll_ready()
+            .map_err(|_| ())
+    }
 }
 
-impl<T, B> Future for BindingClient<T, B>
-where T: AsyncRead + AsyncWrite + 'static,
-      B: Stream<Error=::Error>,
-      B::Item: AsRef<[u8]>,
-{
-    type Item = proto::Conn<T, B::Item, proto::ClientTransaction, Pooled<ProtoClient<B>>>;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.rx.poll() {
-            Ok(Async::Ready(client)) => Ok(Async::Ready(
-                    proto::Conn::new(self.io.take().expect("binding client io lost"), client)
-            )),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(_canceled) => unreachable!(),
+impl<B> Drop for HyperClient<B> {
+    fn drop(&mut self) {
+        if self.should_close.get() {
+            self.should_close.set(false);
+            let _ = self.tx.borrow_mut().try_send(proto::dispatch::ClientMsg::Close);
         }
     }
 }
@@ -463,10 +410,9 @@ impl<C, B> Config<C, B> {
     }
     */
 
-    /// Disable tokio-proto internal usage.
-    #[inline]
-    pub fn no_proto(mut self) -> Config<C, B> {
-        self.no_proto = true;
+    #[doc(hidden)]
+    #[deprecated(since="0.11.11", note="no_proto is always enabled")]
+    pub fn no_proto(self) -> Config<C, B> {
         self
     }
 }
@@ -479,7 +425,18 @@ where C: Connect,
     /// Construct the Client with this configuration.
     #[inline]
     pub fn build(self, handle: &Handle) -> Client<C, B> {
-        Client::configured(self, handle)
+        Client::configured(self, Exec::Handle(handle.clone()))
+    }
+
+    /// Construct a Client with this configuration and an executor.
+    ///
+    /// The executor will be used to spawn "background" connection tasks
+    /// to drive requests and responses.
+    pub fn executor<E>(self, executor: E) -> Client<C, B>
+    where
+        E: Executor<Background> + 'static,
+    {
+        Client::configured(self, Exec::Executor(Rc::new(executor)))
     }
 }
 
@@ -512,3 +469,66 @@ impl<C: Clone, B> Clone for Config<C, B> {
         }
     }
 }
+
+
+// ===== impl Exec =====
+
+#[derive(Clone)]
+enum Exec {
+    Handle(Handle),
+    Executor(Rc<Executor<Background>>),
+}
+
+
+impl Exec {
+    fn execute<F>(&self, fut: F) -> io::Result<()>
+    where
+        F: Future<Item=(), Error=()> + 'static,
+    {
+        match *self {
+            Exec::Handle(ref h) => h.spawn(fut),
+            Exec::Executor(ref e) => {
+                e.execute(bg(Box::new(fut)))
+                    .map_err(|err| {
+                        debug!("executor error: {:?}", err.kind());
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            "executor error",
+                        )
+                    })?
+            },
+        }
+        Ok(())
+    }
+}
+
+// ===== impl Background =====
+
+// The types inside this module are not exported out of the crate,
+// so they are in essence un-nameable.
+mod background {
+    use futures::{Future, Poll};
+
+    // This is basically `impl Future`, since the type is un-nameable,
+    // and only implementeds `Future`.
+    #[allow(missing_debug_implementations)]
+    pub struct Background {
+        inner: Box<Future<Item=(), Error=()>>,
+    }
+
+    pub fn bg(fut: Box<Future<Item=(), Error=()>>) -> Background {
+        Background {
+            inner: fut,
+        }
+    }
+
+    impl Future for Background {
+        type Item = ();
+        type Error = ();
+
+        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+            self.inner.poll()
+        }
+    }
+}
+

@@ -4,8 +4,6 @@
 //! them off to a `Service`.
 
 #[cfg(feature = "compat")]
-mod compat_impl;
-#[cfg(feature = "compat")]
 pub mod compat;
 mod service;
 
@@ -49,13 +47,13 @@ feat_server_proto! {
 
 pub use self::service::{const_service, service_fn};
 
-/// An instance of the HTTP protocol, and implementation of tokio-proto's
-/// `ServerProto` trait.
+/// A configuration of the HTTP protocol.
 ///
 /// This structure is used to create instances of `Server` or to spawn off tasks
 /// which handle a connection to an HTTP server. Each instance of `Http` can be
 /// configured with various protocol-level options such as keepalive.
 pub struct Http<B = ::Chunk> {
+    max_buf_size: Option<usize>,
     keep_alive: bool,
     pipeline: bool,
     _marker: PhantomData<B>,
@@ -74,7 +72,6 @@ where B: Stream<Error=::Error>,
     reactor: Core,
     listener: TcpListener,
     shutdown_timeout: Duration,
-    no_proto: bool,
 }
 
 /// A stream mapping incoming IOs to new services.
@@ -108,6 +105,16 @@ pub struct AddrIncoming {
 /// A future binding a connection with a Service.
 ///
 /// Polling this future will drive HTTP forward.
+///
+/// # Note
+///
+/// This will currently yield an unnameable (`Opaque`) value
+/// on success. The purpose of this is that nothing can be assumed about
+/// the type, not even it's name. It's probable that in a later release,
+/// this future yields the underlying IO object, which could be done without
+/// a breaking change.
+///
+/// It is likely best to just map the value to `()`, for now.
 #[must_use = "futures do nothing unless polled"]
 pub struct Connection<I, S>
 where
@@ -127,29 +134,29 @@ where
 
 // ===== impl Http =====
 
-// This is wrapped in this macro because using `Http` as a `ServerProto` will
-// never trigger a deprecation warning, so we have to annoy more people to
-// protect some others.
-feat_server_proto! {
-    impl<B: AsRef<[u8]> + 'static> Http<B> {
-        /// Creates a new instance of the HTTP protocol, ready to spawn a server or
-        /// start accepting connections.
-        pub fn new() -> Http<B> {
-            Http {
-                keep_alive: true,
-                pipeline: false,
-                _marker: PhantomData,
-            }
+impl<B: AsRef<[u8]> + 'static> Http<B> {
+    /// Creates a new instance of the HTTP protocol, ready to spawn a server or
+    /// start accepting connections.
+    pub fn new() -> Http<B> {
+        Http {
+            keep_alive: true,
+            max_buf_size: None,
+            pipeline: false,
+            _marker: PhantomData,
         }
     }
-}
 
-impl<B: AsRef<[u8]> + 'static> Http<B> {
     /// Enables or disables HTTP keep-alive.
     ///
     /// Default is true.
     pub fn keep_alive(&mut self, val: bool) -> &mut Self {
         self.keep_alive = val;
+        self
+    }
+
+    /// Set the maximum buffer size for the connection.
+    pub fn max_buf_size(&mut self, max: usize) -> &mut Self {
+        self.max_buf_size = Some(max);
         self
     }
 
@@ -187,7 +194,6 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
             listener: listener,
             protocol: self.clone(),
             shutdown_timeout: Duration::new(1, 0),
-            no_proto: false,
         })
     }
 
@@ -201,7 +207,7 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
                     Send + Sync + 'static,
               Bd: Stream<Item=B, Error=::Error>,
     {
-        self.bind(addr, self::compat_impl::new_service(new_service))
+        self.bind(addr, self::compat::new_service(new_service))
     }
 
     /// Bind the provided `addr` and return a server with a shared `Core`.
@@ -238,6 +244,7 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
             new_service: new_service,
             protocol: Http {
                 keep_alive: self.keep_alive,
+                max_buf_size: self.max_buf_size,
                 pipeline: self.pipeline,
                 _marker: PhantomData,
             },
@@ -262,6 +269,9 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
         };
         let mut conn = proto::Conn::new(io, ka);
         conn.set_flush_pipeline(self.pipeline);
+        if let Some(max) = self.max_buf_size {
+            conn.set_max_buf_size(max);
+        }
         Connection {
             conn: proto::dispatch::Dispatcher::new(proto::dispatch::Server::new(service), conn),
         }
@@ -320,9 +330,9 @@ impl<S, B> Server<S, B>
         self
     }
 
-    /// Configure this server to not use tokio-proto infrastructure internally.
+    #[doc(hidden)]
+    #[deprecated(since="0.11.11", note="no_proto is always enabled")]
     pub fn no_proto(&mut self) -> &mut Self {
-        self.no_proto = true;
         self
     }
 
@@ -350,7 +360,7 @@ impl<S, B> Server<S, B>
     pub fn run_until<F>(self, shutdown_signal: F) -> ::Result<()>
         where F: Future<Item = (), Error = ()>,
     {
-        let Server { protocol, new_service, mut reactor, listener, shutdown_timeout, no_proto } = self;
+        let Server { protocol, new_service, mut reactor, listener, shutdown_timeout } = self;
 
         let handle = reactor.handle();
 
@@ -363,20 +373,16 @@ impl<S, B> Server<S, B>
         // Future for our server's execution
         let srv = listener.incoming().for_each(|(socket, addr)| {
             socket.set_nodelay(true)?;
+            let addr_service = SocketAddrService::new(addr, new_service.new_service()?);
             let s = NotifyService {
-                inner: try!(new_service.new_service()),
+                inner: addr_service,
                 info: Rc::downgrade(&info),
             };
             info.borrow_mut().active += 1;
-            if no_proto {
-                let fut = protocol.serve_connection(socket, s)
-                    .map(|_| ())
-                    .map_err(|err| error!("no_proto error: {}", err));
-                handle.spawn(fut);
-            } else {
-                #[allow(deprecated)]
-                protocol.bind_connection(&handle, socket, addr, s);
-            }
+            let fut = protocol.serve_connection(socket, s)
+                .map(|_| ())
+                .map_err(move |err| error!("server connection error: ({}) {}", addr, err));
+            handle.spawn(fut);
             Ok(())
         });
 
@@ -537,6 +543,18 @@ where
     }
 }
 
+impl<I, B, S> Connection<I, S>
+where S: Service<Request = Request, Response = Response<B>, Error = ::Error> + 'static,
+      I: AsyncRead + AsyncWrite + 'static,
+      B: Stream<Error=::Error> + 'static,
+      B::Item: AsRef<[u8]>,
+{
+    /// Disables keep-alive for this connection.
+    pub fn disable_keep_alive(&mut self) {
+        self.conn.disable_keep_alive()
+    }
+}
+
 mod unnameable {
     // This type is specifically not exported outside the crate,
     // so no one can actually name the type. With no methods, we make no
@@ -647,6 +665,41 @@ mod addr_stream {
         }
     }
 }
+
+// ===== SocketAddrService
+
+// This is used from `Server::run`, which captures the remote address
+// in this service, and then injects it into each `Request`.
+struct SocketAddrService<S> {
+    addr: SocketAddr,
+    inner: S,
+}
+
+impl<S> SocketAddrService<S> {
+    fn new(addr: SocketAddr, service: S) -> SocketAddrService<S> {
+        SocketAddrService {
+            addr: addr,
+            inner: service,
+        }
+    }
+}
+
+impl<S> Service for SocketAddrService<S>
+where
+    S: Service<Request=Request>,
+{
+    type Request = S::Request;
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn call(&self, mut req: Self::Request) -> Self::Future {
+        proto::request::addr(&mut req, self.addr);
+        self.inner.call(req)
+    }
+}
+
+// ===== NotifyService =====
 
 struct NotifyService<S> {
     inner: S,

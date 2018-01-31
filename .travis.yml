@@ -8,11 +8,12 @@ matrix:
           env: FEATURES="--features nightly"
         - rust: beta
         - rust: stable
+          env: HYPER_DOCS=1
         - rust: stable
-          env: HYPER_NO_PROTO=1
+          env: FEATURES="--no-default-features"
         - rust: stable
           env: FEATURES="--features compat"
-        - rust: 1.17.0
+        - rust: 1.18.0
 
 cache:
     apt: true
@@ -22,8 +23,8 @@ cache:
 
 script:
   - ./.travis/readme.py
-  - cargo build --verbose $FEATURES
-  - cargo test --verbose $FEATURES
+  - cargo build $FEATURES
+  - 'if [ "$BUILD_ONLY" != "1" ]; then cargo test $FEATURES; fi'
   - 'if [ $TRAVIS_RUST_VERSION = nightly ]; then for f in ./benches/*.rs; do cargo test --bench $(basename $f .rs) $FEATURES; done; fi'
 
 addons:
@@ -37,7 +38,7 @@ addons:
 
 
 after_success:
-  - '[ $TRAVIS_RUST_VERSION = stable ] &&
+  - '[ "$HYPER_DOCS" = "1" ] &&
     LOCAL="~/.local" && export PATH=$LOCAL/bin:$PATH &&
     wget https://github.com/SimonKagstrom/kcov/archive/master.tar.gz &&
     tar xzf master.tar.gz && mkdir kcov-master/build && cd kcov-master/build &&
@@ -51,7 +52,7 @@ after_success:
       fi;
     done &&
     kcov --coveralls-id=$TRAVIS_JOB_ID --merge target/cov target/cov/*'
-  - '[ $TRAVIS_PULL_REQUEST = false ] && [ $TRAVIS_RUST_VERSION = stable ] &&
+  - '[ $TRAVIS_PULL_REQUEST = false ] && [ "$HYPER_DOCS" = "1" ] &&
     { [ "$TRAVIS_TAG" != "" ] || [ "$TRAVIS_BRANCH" == "master" ]; } &&
     ./.travis/docs.sh'
 

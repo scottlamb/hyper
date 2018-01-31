@@ -1,3 +1,122 @@
+### v0.11.16 (2018-01-30)
+
+
+#### Bug Fixes
+
+* **client:**
+  * check for dead connections in Pool ([44af2738](https://github.com/hyperium/hyper/commit/44af273853f82b81591b813d13627e143a14a6b7), closes [#1429](https://github.com/hyperium/hyper/issues/1429))
+  * error on unsupport 101 responses, ignore other 1xx codes ([22774222](https://github.com/hyperium/hyper/commit/227742221fa7830a14c18becbbc6137d97b57729))
+* **server:**
+  * send 400 responses on parse errors before closing connection ([7cb72d20](https://github.com/hyperium/hyper/commit/7cb72d2019bffbc667b9ad2d8cbc19c1a513fcf7))
+  * error if Response code is 1xx ([44c34ce9](https://github.com/hyperium/hyper/commit/44c34ce9adc888916bd67656cc54c35f7908f536))
+
+
+#### Features
+
+* **server:** add `Http::max_buf_size()` option ([d22deb65](https://github.com/hyperium/hyper/commit/d22deb6572c279e11773b6bcb862415c08f19c2e), closes [#1368](https://github.com/hyperium/hyper/issues/1368))
+* **uri:** Add a `PartialEq<str>` impl for `Uri` ([11b49c2c](https://github.com/hyperium/hyper/commit/11b49c2cc84695e966e9d9a0b05781853b28d7a8))
+
+#### Performance
+
+- **h1:** utilize `writev` when possible, reducing copies ([68377ede](https://github.com/hyperium/hyper/commit/68377ede))
+
+### v0.11.15 (2018-01-22)
+
+
+#### Bug Fixes
+
+* **lib:** properly handle HTTP/1.0 remotes ([36e66a50](https://github.com/hyperium/hyper/commit/36e66a50546347c6f9b74c6d3c26e8b910483a4b), closes [#1304](https://github.com/hyperium/hyper/issues/1304))
+
+
+#### Features
+
+* **client:** add `executor` method when configuring a `Client` ([c89019eb](https://github.com/hyperium/hyper/commit/c89019eb100d00b5235d3b9a0d0b672ab0ef8ddc))
+
+
+### v0.11.14 (2018-01-16)
+
+
+#### Bug Fixes
+
+* **tokio-proto:** return end-of-body frame correctly for tokio-proto ([14e4c741](https://github.com/hyperium/hyper/commit/14e4c741dc48a386d7bdc6f8e9e279e60f172722), closes [#1414](https://github.com/hyperium/hyper/issues/1414))
+
+
+### v0.11.13 (2018-01-12)
+
+
+#### Bug Fixes
+
+* **client:**
+  * change connection errors to debug log level ([2fe90f25](https://github.com/hyperium/hyper/commit/2fe90f256420ff668966290ac96686ce061453e4), closes [#1412](https://github.com/hyperium/hyper/issues/1412))
+  * don't error on read before writing request ([7976023b](https://github.com/hyperium/hyper/commit/7976023b594ec6784e40a147d3baec99a947b118))
+* **lib:** properly handle body streaming errors ([7a48d0e8](https://github.com/hyperium/hyper/commit/7a48d0e8b4ad465c0205ddfb116b6bd60dbdec71))
+
+
+### v0.11.12 (2018-01-08)
+
+
+#### Bug Fixes
+
+* **server:** add remote_addr back to Request when using Http::bind ([fa7f4377](https://github.com/hyperium/hyper/commit/fa7f4377c1d783ca860820aefc41d0eab73be14c), closes [#1410](https://github.com/hyperium/hyper/issues/1410))
+
+
+### v0.11.11 (2018-01-05)
+
+
+#### Features
+
+* **client:** replace default dispatcher ([0892cb27](https://github.com/hyperium/hyper/commit/0892cb27777858737449a012bc6ea08ee080e5b7))
+* **server:** change default dispatcher ([6ade21aa](https://github.com/hyperium/hyper/commit/6ade21aa7f16dfeb6c0c53fe39c3f168f5f8aec1))
+
+
+### v0.11.10 (2017-12-26)
+
+
+#### Bug Fixes
+
+* **client:**
+  * fix panic when request body is empty string ([bfb0f84d](https://github.com/hyperium/hyper/commit/bfb0f84d372ec4251a20d16a1ac514a4177e2a3b))
+  * close connections when Response Future or Body is dropped ([ef400812](https://github.com/hyperium/hyper/commit/ef4008121e4faa9383fe4661ebd05de5efe7ee9c), closes [#1397](https://github.com/hyperium/hyper/issues/1397))
+  * properly close idle connections after timeout ([139dc7ab](https://github.com/hyperium/hyper/commit/139dc7ab2be271cd58b909db16c6ddbe5109f133), closes [#1397](https://github.com/hyperium/hyper/issues/1397))
+* **conn:** don't double shutdown in some cases ([7d3abfbc](https://github.com/hyperium/hyper/commit/7d3abfbcf33946cb8831103c3b55f9966fa9469d))
+
+
+### v0.11.9 (2017-12-09)
+
+
+#### Bug Fixes
+
+* **client:** detect valid eof after reading a body ([15fdd53d](https://github.com/hyperium/hyper/commit/15fdd53d4cb1cd0fef41c4bed509020f44512a00), closes [#1396](https://github.com/hyperium/hyper/issues/1396))
+
+
+#### Features
+
+* **log:** improve quality of debug level logs ([7b593112](https://github.com/hyperium/hyper/commit/7b5931122a07f2a766d3e103001bcb5ee1f983f3))
+
+
+### v0.11.8 (2017-12-06)
+
+
+#### Bug Fixes
+
+* **client:**
+  * return error instead of unmatched response when idle ([95e0164e](https://github.com/hyperium/hyper/commit/95e0164e8f0f03742f71868cb2828bcd4bfa5cfc))
+  * remove idle connections when read eof is found ([cecef9d4](https://github.com/hyperium/hyper/commit/cecef9d402b76af12e6415519deb2b604f77b195))
+  * always wait on reads for pooled connections ([9f212410](https://github.com/hyperium/hyper/commit/9f212410026c780ea2a76ba81705ed137022260d))
+  * don't leak connections with no keep-alive ([d2aa5d86](https://github.com/hyperium/hyper/commit/d2aa5d862c95168f4e71cc65155c2dc41f306f36), closes [#1383](https://github.com/hyperium/hyper/issues/1383))
+* **conn:** handle when pre-emptive flushing closes the write state ([8f938d97](https://github.com/hyperium/hyper/commit/8f938d97e7f25ca9e8c9ae65f756f952753d9bf7), closes [#1391](https://github.com/hyperium/hyper/issues/1391))
+* **lib:** fix `no_proto` dispatcher to flush queue before polling more body ([121b5eef](https://github.com/hyperium/hyper/commit/121b5eef19e65acfecb8261d865554e173f2fc78))
+* **server:** allow TLS shutdown before dropping connections with `no_proto` ([60d0eaf8](https://github.com/hyperium/hyper/commit/60d0eaf8916f7cb5073105778f25dff21bd504bb), closes [#1380](https://github.com/hyperium/hyper/issues/1380))
+
+
+#### Features
+
+* **headers:** Implement `ProxyAuthorization` (#1394) ([c93cdb29](https://github.com/hyperium/hyper/commit/c93cdb290875cb86900e84c333725aefa4d7fad5))
+* **server:**
+  * Allow keep alive to be turned off for a connection (#1390) ([eb9590e3](https://github.com/hyperium/hyper/commit/eb9590e3da65299928938ae8bb830dfb008fdadd), closes [#1365](https://github.com/hyperium/hyper/issues/1365))
+  * add `Http.serve_incoming` to wrap generic accept steams ([e4864a2b](https://github.com/hyperium/hyper/commit/e4864a2bea59b40fb07e6d18329f75817803a3f3))
+
+
 ### v0.11.7 (2017-11-14)
 
 

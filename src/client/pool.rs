@@ -15,6 +15,15 @@ pub struct Pool<T> {
     inner: Rc<RefCell<PoolInner<T>>>,
 }
 
+// Before using a pooled connection, make sure the sender is not dead.
+//
+// This is a trait to allow the `client::pool::tests` to work for `i32`.
+//
+// See https://github.com/hyperium/hyper/issues/1429
+pub trait Ready {
+    fn poll_ready(&mut self) -> Poll<(), ()>;
+}
+
 struct PoolInner<T> {
     enabled: bool,
     // These are internal Conns sitting in the event loop in the KeepAlive
@@ -85,6 +94,7 @@ impl<T: Clone> Pool<T> {
 
         match entry {
             Some(entry) => {
+                debug!("pooling idle connection for {:?}", key);
                 inner.idle.entry(key)
                      .or_insert(Vec::new())
                      .push(entry);
@@ -95,7 +105,6 @@ impl<T: Clone> Pool<T> {
 
 
     pub fn pooled(&self, key: Rc<String>, value: T) -> Pooled<T> {
-        trace!("Pool::pooled {:?}", key);
         Pooled {
             entry: Entry {
                 value: value,
@@ -112,7 +121,7 @@ impl<T: Clone> Pool<T> {
     }
 
     fn reuse(&self, key: Rc<String>, mut entry: Entry<T>) -> Pooled<T> {
-        trace!("Pool::reuse {:?}", key);
+        trace!("reuse {:?}", key);
         entry.is_reused = true;
         entry.status.set(TimedKA::Busy);
         Pooled {
@@ -123,7 +132,7 @@ impl<T: Clone> Pool<T> {
     }
 
     fn park(&mut self, key: Rc<String>, tx: relay::Sender<Entry<T>>) {
-        trace!("Pool::park {:?}", key);
+        trace!("park; waiting for idle connection: {:?}", key);
         self.inner.borrow_mut()
             .parked.entry(key)
             .or_insert(VecDeque::new())
@@ -133,7 +142,7 @@ impl<T: Clone> Pool<T> {
 
 impl<T> Pool<T> {
     fn clean_parked(&mut self, key: &Rc<String>) {
-        trace!("Pool::clean_parked {:?}", key);
+        trace!("clean_parked {:?}", key);
         let mut inner = self.inner.borrow_mut();
 
         let mut remove_parked = false;
@@ -200,10 +209,13 @@ impl<T: Clone> KeepAlive for Pooled<T> {
             };
             if pool.is_enabled() {
                 pool.put(self.key.clone(), self.entry.clone());
+            } else {
+                trace!("keepalive disabled, dropping pooled ({:?})", self.key);
+                self.disable();
             }
         } else {
             trace!("pool dropped, dropping pooled ({:?})", self.key);
-            self.entry.status.set(TimedKA::Disabled);
+            self.disable();
         }
     }
 
@@ -253,7 +265,7 @@ pub struct Checkout<T> {
     parked: Option<relay::Receiver<Entry<T>>>,
 }
 
-impl<T: Clone> Future for Checkout<T> {
+impl<T: Ready + Clone> Future for Checkout<T> {
     type Item = Pooled<T>;
     type Error = io::Error;
 
@@ -279,21 +291,22 @@ impl<T: Clone> Future for Checkout<T> {
         let mut should_remove = false;
         let entry = self.pool.inner.borrow_mut().idle.get_mut(key).and_then(|list| {
             trace!("Checkout::poll key found {:?}", key);
-            while let Some(entry) = list.pop() {
+            while let Some(mut entry) = list.pop() {
                 match entry.status.get() {
                     TimedKA::Idle(idle_at) if !expiration.expires(idle_at) => {
-                        trace!("Checkout::poll found idle client for {:?}", key);
-                        should_remove = list.is_empty();
-                        return Some(entry);
+                        if let Ok(Async::Ready(())) = entry.value.poll_ready() {
+                            debug!("found idle connection for {:?}", key);
+                            should_remove = list.is_empty();
+                            return Some(entry);
+                        }
                     },
-                    _ => {
-                        trace!("Checkout::poll removing unacceptable pooled {:?}", key);
-                        // every other case the Entry should just be dropped
-                        // 1. Idle but expired
-                        // 2. Busy (something else somehow took it?)
-                        // 3. Disabled don't reuse of course
-                    }
+                    _ => {},
                 }
+                trace!("Checkout::poll removing unacceptable pooled {:?}", key);
+                // every other case the Entry should just be dropped
+                // 1. Idle but expired
+                // 2. Busy (something else somehow took it?)
+                // 3. Disabled don't reuse of course
             }
             should_remove = true;
             None
@@ -344,10 +357,16 @@ impl Expiration {
 mod tests {
     use std::rc::Rc;
     use std::time::Duration;
-    use futures::{Async, Future};
+    use futures::{Async, Future, Poll};
     use futures::future;
     use proto::KeepAlive;
-    use super::Pool;
+    use super::{Ready, Pool};
+
+    impl Ready for i32 {
+        fn poll_ready(&mut self) -> Poll<(), ()> {
+            Ok(Async::Ready(()))
+        }
+    }
 
     #[test]
     fn test_pool_checkout_smoke() {

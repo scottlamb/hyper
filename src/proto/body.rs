@@ -1,32 +1,53 @@
 use bytes::Bytes;
-use futures::{Poll, Stream};
-use futures::sync::mpsc;
+use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
+use futures::sync::{mpsc, oneshot};
+#[cfg(feature = "tokio-proto")]
 use tokio_proto;
 use std::borrow::Cow;
 
 use super::Chunk;
 
+#[cfg(feature = "tokio-proto")]
 pub type TokioBody = tokio_proto::streaming::Body<Chunk, ::Error>;
 pub type BodySender = mpsc::Sender<Result<Chunk, ::Error>>;
 
 /// A `Stream` for `Chunk`s used in requests and responses.
 #[must_use = "streams do nothing unless polled"]
 #[derive(Debug)]
-pub struct Body(TokioBody);
+pub struct Body(Inner);
+
+#[derive(Debug)]
+enum Inner {
+    #[cfg(feature = "tokio-proto")]
+    Tokio(TokioBody),
+    Chan {
+        close_tx: oneshot::Sender<bool>,
+        rx: mpsc::Receiver<Result<Chunk, ::Error>>,
+    },
+    Once(Option<Chunk>),
+    Empty,
+}
+
+//pub(crate)
+#[derive(Debug)]
+pub struct ChunkSender {
+    close_rx: oneshot::Receiver<bool>,
+    close_rx_check: bool,
+    tx: BodySender,
+}
 
 impl Body {
     /// Return an empty body stream
     #[inline]
     pub fn empty() -> Body {
-        Body(TokioBody::empty())
+        Body(Inner::Empty)
     }
 
     /// Return a body stream with an associated sender half
     #[inline]
     pub fn pair() -> (mpsc::Sender<Result<Chunk, ::Error>>, Body) {
-        let (tx, rx) = TokioBody::pair();
-        let rx = Body(rx);
-        (tx, rx)
+        let (tx, rx) = channel();
+        (tx.tx, rx)
     }
 }
 
@@ -43,60 +64,126 @@ impl Stream for Body {
 
     #[inline]
     fn poll(&mut self) -> Poll<Option<Chunk>, ::Error> {
-        self.0.poll()
+        match self.0 {
+            #[cfg(feature = "tokio-proto")]
+            Inner::Tokio(ref mut rx) => rx.poll(),
+            Inner::Chan { ref mut rx, .. } => match rx.poll().expect("mpsc cannot error") {
+                Async::Ready(Some(Ok(chunk))) => Ok(Async::Ready(Some(chunk))),
+                Async::Ready(Some(Err(err))) => Err(err),
+                Async::Ready(None) => Ok(Async::Ready(None)),
+                Async::NotReady => Ok(Async::NotReady),
+            },
+            Inner::Once(ref mut val) => Ok(Async::Ready(val.take())),
+            Inner::Empty => Ok(Async::Ready(None)),
+        }
     }
 }
 
-// deprecate soon, but can't really deprecate trait impls
-#[doc(hidden)]
-impl From<Body> for tokio_proto::streaming::Body<Chunk, ::Error> {
-    #[inline]
-    fn from(b: Body) -> tokio_proto::streaming::Body<Chunk, ::Error> {
-        b.0
+//pub(crate)
+pub fn channel() -> (ChunkSender, Body) {
+    let (tx, rx) = mpsc::channel(0);
+    let (close_tx, close_rx) = oneshot::channel();
+
+    let tx = ChunkSender {
+        close_rx: close_rx,
+        close_rx_check: true,
+        tx: tx,
+    };
+    let rx = Body(Inner::Chan {
+        close_tx: close_tx,
+        rx: rx,
+    });
+
+    (tx, rx)
+}
+
+impl ChunkSender {
+    pub fn poll_ready(&mut self) -> Poll<(), ()> {
+        if self.close_rx_check {
+            match self.close_rx.poll() {
+                Ok(Async::Ready(true)) | Err(_) => return Err(()),
+                Ok(Async::Ready(false)) => {
+                    // needed to allow converting into a plain mpsc::Receiver
+                    // if it has been, the tx will send false to disable this check
+                    self.close_rx_check = false;
+                }
+                Ok(Async::NotReady) => (),
+            }
+        }
+
+        self.tx.poll_ready().map_err(|_| ())
+    }
+
+    pub fn start_send(&mut self, msg: Result<Chunk, ::Error>) -> StartSend<(), ()> {
+        match self.tx.start_send(msg) {
+            Ok(AsyncSink::Ready) => Ok(AsyncSink::Ready),
+            Ok(AsyncSink::NotReady(_)) => Ok(AsyncSink::NotReady(())),
+            Err(_) => Err(()),
+        }
     }
 }
 
-// deprecate soon, but can't really deprecate trait impls
-#[doc(hidden)]
-impl From<tokio_proto::streaming::Body<Chunk, ::Error>> for Body {
-    #[inline]
-    fn from(tokio_body: tokio_proto::streaming::Body<Chunk, ::Error>) -> Body {
-        Body(tokio_body)
+feat_server_proto! {
+    impl From<Body> for tokio_proto::streaming::Body<Chunk, ::Error> {
+        fn from(b: Body) -> tokio_proto::streaming::Body<Chunk, ::Error> {
+            match b.0 {
+                Inner::Tokio(b) => b,
+                Inner::Chan { close_tx, rx } => {
+                    // disable knowing if the Rx gets dropped, since we cannot
+                    // pass this tx along.
+                    let _ = close_tx.send(false);
+                    rx.into()
+                },
+                Inner::Once(Some(chunk)) => TokioBody::from(chunk),
+                Inner::Once(None) |
+                Inner::Empty => TokioBody::empty(),
+            }
+        }
+    }
+
+    impl From<tokio_proto::streaming::Body<Chunk, ::Error>> for Body {
+        fn from(tokio_body: tokio_proto::streaming::Body<Chunk, ::Error>) -> Body {
+            Body(Inner::Tokio(tokio_body))
+        }
     }
 }
 
 impl From<mpsc::Receiver<Result<Chunk, ::Error>>> for Body {
     #[inline]
     fn from(src: mpsc::Receiver<Result<Chunk, ::Error>>) -> Body {
-        Body(src.into())
+        let (tx, _) = oneshot::channel();
+        Body(Inner::Chan {
+            close_tx: tx,
+            rx: src,
+        })
     }
 }
 
 impl From<Chunk> for Body {
     #[inline]
     fn from (chunk: Chunk) -> Body {
-        Body(TokioBody::from(chunk))
+        Body(Inner::Once(Some(chunk)))
     }
 }
 
 impl From<Bytes> for Body {
     #[inline]
     fn from (bytes: Bytes) -> Body {
-        Body(TokioBody::from(Chunk::from(bytes)))
+        Body::from(Chunk::from(bytes))
     }
 }
 
 impl From<Vec<u8>> for Body {
     #[inline]
     fn from (vec: Vec<u8>) -> Body {
-        Body(TokioBody::from(Chunk::from(vec)))
+        Body::from(Chunk::from(vec))
     }
 }
 
 impl From<&'static [u8]> for Body {
     #[inline]
     fn from (slice: &'static [u8]) -> Body {
-        Body(TokioBody::from(Chunk::from(slice)))
+        Body::from(Chunk::from(slice))
     }
 }
 
@@ -113,14 +200,14 @@ impl From<Cow<'static, [u8]>> for Body {
 impl From<String> for Body {
     #[inline]
     fn from (s: String) -> Body {
-        Body(TokioBody::from(Chunk::from(s.into_bytes())))
+        Body::from(Chunk::from(s.into_bytes()))
     }
 }
 
 impl From<&'static str> for Body {
     #[inline]
     fn from(slice: &'static str) -> Body {
-        Body(TokioBody::from(Chunk::from(slice.as_bytes())))
+        Body::from(Chunk::from(slice.as_bytes()))
     }
 }
 

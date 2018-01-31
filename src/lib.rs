@@ -1,4 +1,4 @@
-#![doc(html_root_url = "https://docs.rs/hyper/0.11.7")]
+#![doc(html_root_url = "https://docs.rs/hyper/0.11.16")]
 #![deny(missing_docs)]
 #![deny(warnings)]
 #![deny(missing_debug_implementations)]
@@ -24,6 +24,7 @@ extern crate futures_cpupool;
 #[cfg(feature = "compat")]
 extern crate http;
 extern crate httparse;
+extern crate iovec;
 extern crate language_tags;
 #[macro_use] extern crate log;
 pub extern crate mime;
@@ -32,6 +33,7 @@ extern crate relay;
 extern crate time;
 extern crate tokio_core as tokio;
 #[macro_use] extern crate tokio_io;
+#[cfg(feature = "tokio-proto")]
 extern crate tokio_proto;
 extern crate tokio_service;
 extern crate unicase;
@@ -55,17 +57,13 @@ pub use proto::RawStatus;
 
 macro_rules! feat_server_proto {
     ($($i:item)*) => ($(
-        #[cfg_attr(
-            not(feature = "server-proto"),
-            deprecated(
-                since="0.11.7",
-                note="server-proto was recently added to default features, but you have disabled default features. A future version will remove these types if the server-proto feature is not enabled."
-            )
+        #[cfg(feature = "server-proto")]
+        #[deprecated(
+            since="0.11.11",
+            note="All usage of the tokio-proto crate is going away."
         )]
-        #[cfg_attr(
-            not(feature = "server-proto"),
-            allow(deprecated)
-        )]
+        #[doc(hidden)]
+        #[allow(deprecated)]
         $i
     )*)
 }

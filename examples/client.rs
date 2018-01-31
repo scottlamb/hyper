@@ -14,7 +14,7 @@ use futures::stream::Stream;
 use hyper::Client;
 
 fn main() {
-    pretty_env_logger::init().unwrap();
+    pretty_env_logger::init();
 
     let url = match env::args().nth(1) {
         Some(url) => url,
@@ -32,9 +32,7 @@ fn main() {
 
     let mut core = tokio_core::reactor::Core::new().unwrap();
     let handle = core.handle();
-    let client = Client::configure()
-        .no_proto()
-        .build(&handle);
+    let client = Client::new(&handle);
 
     let work = client.get(url).and_then(|res| {
         println!("Response: {}", res.status());

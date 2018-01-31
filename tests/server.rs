@@ -4,22 +4,27 @@ extern crate futures;
 extern crate spmc;
 extern crate pretty_env_logger;
 extern crate tokio_core;
+extern crate tokio_io;
 
 use futures::{Future, Stream};
-use futures::future::{self, FutureResult};
+use futures::future::{self, FutureResult, Either};
 use futures::sync::oneshot;
 
 use tokio_core::net::TcpListener;
-use tokio_core::reactor::Core;
+use tokio_core::reactor::{Core, Timeout};
+use tokio_io::{AsyncRead, AsyncWrite};
 
-use std::net::{TcpStream, SocketAddr};
-use std::io::{Read, Write};
+use std::net::{TcpStream, Shutdown, SocketAddr};
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use hyper::server::{Http, Request, Response, Service, NewService};
+use hyper::StatusCode;
+use hyper::header::ContentLength;
+use hyper::server::{Http, Request, Response, Service, NewService, service_fn};
 
 
 #[test]
@@ -143,6 +148,75 @@ fn get_chunked_response() {
 }
 
 #[test]
+fn get_auto_response() {
+    let foo_bar = b"foo bar baz";
+    let server = serve();
+    server.reply()
+        .status(hyper::Ok)
+        .body(foo_bar);
+    let mut req = connect(server.addr());
+    req.write_all(b"\
+        GET / HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Connection: close\r\n\
+        \r\n\
+    ").unwrap();
+    let mut body = String::new();
+    req.read_to_string(&mut body).unwrap();
+
+    assert!(has_header(&body, "Transfer-Encoding: chunked"));
+
+    let n = body.find("\r\n\r\n").unwrap() + 4;
+    assert_eq!(&body[n..], "B\r\nfoo bar baz\r\n0\r\n\r\n");
+}
+
+#[test]
+fn http_10_get_auto_response() {
+    let foo_bar = b"foo bar baz";
+    let server = serve();
+    server.reply()
+        .status(hyper::Ok)
+        .body(foo_bar);
+    let mut req = connect(server.addr());
+    req.write_all(b"\
+        GET / HTTP/1.0\r\n\
+        Host: example.domain\r\n\
+        \r\n\
+    ").unwrap();
+    let mut body = String::new();
+    req.read_to_string(&mut body).unwrap();
+
+    assert!(!has_header(&body, "Transfer-Encoding:"));
+
+    let n = body.find("\r\n\r\n").unwrap() + 4;
+    assert_eq!(&body[n..], "foo bar baz");
+}
+
+#[test]
+fn http_10_get_chunked_response() {
+    let foo_bar = b"foo bar baz";
+    let server = serve();
+    server.reply()
+        .status(hyper::Ok)
+        // this header should actually get removed
+        .header(hyper::header::TransferEncoding::chunked())
+        .body(foo_bar);
+    let mut req = connect(server.addr());
+    req.write_all(b"\
+        GET / HTTP/1.0\r\n\
+        Host: example.domain\r\n\
+        \r\n\
+    ").unwrap();
+    let mut body = String::new();
+    req.read_to_string(&mut body).unwrap();
+
+    assert!(!has_header(&body, "Transfer-Encoding:"));
+
+    let n = body.find("\r\n\r\n").unwrap() + 4;
+    assert_eq!(&body[n..], "foo bar baz");
+}
+
+#[test]
 fn get_chunked_response_with_ka() {
     let foo_bar = b"foo bar baz";
     let foo_bar_chunk = b"\r\nfoo bar baz\r\n0\r\n\r\n";
@@ -221,6 +295,26 @@ fn post_with_chunked_body() {
 }
 
 #[test]
+fn post_with_incomplete_body() {
+    extern crate pretty_env_logger;
+    let _ = pretty_env_logger::try_init();
+    let server = serve();
+    let mut req = connect(server.addr());
+    req.write_all(b"\
+        POST / HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Content-Length: 10\r\n\
+        \r\n\
+        12345\
+    ").expect("write");
+    req.shutdown(Shutdown::Write).expect("shutdown write");
+
+    server.body_err();
+
+    req.read(&mut [0; 256]).expect("read");
+}
+
+#[test]
 fn empty_response_chunked() {
     let server = serve();
 
@@ -257,7 +351,7 @@ fn empty_response_chunked() {
 #[test]
 fn empty_response_chunked_without_body_should_set_content_length() {
     extern crate pretty_env_logger;
-    let _ = pretty_env_logger::init();
+    let _ = pretty_env_logger::try_init();
     let server = serve();
     server.reply()
         .status(hyper::Ok)
@@ -287,7 +381,7 @@ fn empty_response_chunked_without_body_should_set_content_length() {
 #[test]
 fn head_response_can_send_content_length() {
     extern crate pretty_env_logger;
-    let _ = pretty_env_logger::init();
+    let _ = pretty_env_logger::try_init();
     let server = serve();
     server.reply()
         .status(hyper::Ok)
@@ -316,7 +410,7 @@ fn head_response_can_send_content_length() {
 #[test]
 fn response_does_not_set_chunked_if_body_not_allowed() {
     extern crate pretty_env_logger;
-    let _ = pretty_env_logger::init();
+    let _ = pretty_env_logger::try_init();
     let server = serve();
     server.reply()
         .status(hyper::StatusCode::NotModified)
@@ -355,7 +449,6 @@ fn keep_alive() {
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
         Host: example.domain\r\n\
-        Connection: keep-alive\r\n\
         \r\n\
     ").expect("writing 1");
 
@@ -365,7 +458,6 @@ fn keep_alive() {
         if n < buf.len() {
             if &buf[n - foo_bar.len()..n] == foo_bar {
                 break;
-            } else {
             }
         }
     }
@@ -381,6 +473,57 @@ fn keep_alive() {
         GET /quux HTTP/1.1\r\n\
         Host: example.domain\r\n\
         Connection: close\r\n\
+        \r\n\
+    ").expect("writing 2");
+
+    let mut buf = [0; 1024 * 8];
+    loop {
+        let n = req.read(&mut buf[..]).expect("reading 2");
+        assert!(n > 0, "n = {}", n);
+        if n < buf.len() {
+            if &buf[n - quux.len()..n] == quux {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn http_10_keep_alive() {
+    let foo_bar = b"foo bar baz";
+    let server = serve();
+    server.reply()
+        .status(hyper::Ok)
+        .header(hyper::header::ContentLength(foo_bar.len() as u64))
+        .body(foo_bar);
+    let mut req = connect(server.addr());
+    req.write_all(b"\
+        GET / HTTP/1.0\r\n\
+        Host: example.domain\r\n\
+        Connection: keep-alive\r\n\
+        \r\n\
+    ").expect("writing 1");
+
+    let mut buf = [0; 1024 * 8];
+    loop {
+        let n = req.read(&mut buf[..]).expect("reading 1");
+        if n < buf.len() {
+            if &buf[n - foo_bar.len()..n] == foo_bar {
+                break;
+            }
+        }
+    }
+
+    // try again!
+
+    let quux = b"zar quux";
+    server.reply()
+        .status(hyper::Ok)
+        .header(hyper::header::ContentLength(quux.len() as u64))
+        .body(quux);
+    req.write_all(b"\
+        GET /quux HTTP/1.0\r\n\
+        Host: example.domain\r\n\
         \r\n\
     ").expect("writing 2");
 
@@ -488,8 +631,14 @@ fn expect_continue() {
 fn pipeline_disabled() {
     let server = serve();
     let mut req = connect(server.addr());
-    server.reply().status(hyper::Ok);
-    server.reply().status(hyper::Ok);
+    server.reply()
+        .status(hyper::Ok)
+        .header(ContentLength(12))
+        .body("Hello World!");
+    server.reply()
+        .status(hyper::Ok)
+        .header(ContentLength(12))
+        .body("Hello World!");
 
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -529,8 +678,14 @@ fn pipeline_enabled() {
         .. Default::default()
     });
     let mut req = connect(server.addr());
-    server.reply().status(hyper::Ok);
-    server.reply().status(hyper::Ok);
+    server.reply()
+        .status(hyper::Ok)
+        .header(ContentLength(12))
+        .body("Hello World\n");
+    server.reply()
+        .status(hyper::Ok)
+        .header(ContentLength(12))
+        .body("Hello World\n");
 
     req.write_all(b"\
         GET / HTTP/1.1\r\n\
@@ -545,6 +700,23 @@ fn pipeline_enabled() {
     let mut buf = vec![0; 4096];
     let n = req.read(&mut buf).expect("read 1");
     assert_ne!(n, 0);
+
+    {
+        let mut lines = buf.split(|&b| b == b'\n');
+        assert_eq!(s(lines.next().unwrap()), "HTTP/1.1 200 OK\r");
+        assert_eq!(s(lines.next().unwrap()), "Content-Length: 12\r");
+        lines.next().unwrap(); // Date
+        assert_eq!(s(lines.next().unwrap()), "\r");
+        assert_eq!(s(lines.next().unwrap()), "Hello World");
+
+        assert_eq!(s(lines.next().unwrap()), "HTTP/1.1 200 OK\r");
+        assert_eq!(s(lines.next().unwrap()), "Content-Length: 12\r");
+        lines.next().unwrap(); // Date
+        assert_eq!(s(lines.next().unwrap()), "\r");
+        assert_eq!(s(lines.next().unwrap()), "Hello World");
+    }
+
+
     // with pipeline enabled, both responses should have been in the first read
     // so a second read should be EOF
     let n = req.read(&mut buf).expect("read 2");
@@ -552,7 +724,138 @@ fn pipeline_enabled() {
 }
 
 #[test]
-fn no_proto_empty_parse_eof_does_not_return_error() {
+fn http_10_request_receives_http_10_response() {
+    let server = serve();
+
+    let mut req = connect(server.addr());
+    req.write_all(b"\
+        GET / HTTP/1.0\r\n\
+        \r\n\
+    ").unwrap();
+
+    let expected = "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n";
+    let mut buf = [0; 256];
+    let n = req.read(&mut buf).unwrap();
+    assert!(n >= expected.len(), "read: {:?} >= {:?}", n, expected.len());
+    assert_eq!(s(&buf[..expected.len()]), expected);
+}
+
+#[test]
+fn disable_keep_alive_mid_request() {
+    let mut core = Core::new().unwrap();
+    let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let child = thread::spawn(move || {
+        let mut req = connect(&addr);
+        req.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+        tx1.send(()).unwrap();
+        rx2.wait().unwrap();
+        req.write_all(b"Host: localhost\r\n\r\n").unwrap();
+        let mut buf = vec![];
+        req.read_to_end(&mut buf).unwrap();
+    });
+
+    let fut = listener.incoming()
+        .into_future()
+        .map_err(|_| unreachable!())
+        .and_then(|(item, _incoming)| {
+            let (socket, _) = item.unwrap();
+            Http::<hyper::Chunk>::new().serve_connection(socket, HelloWorld)
+                .select2(rx1)
+                .then(|r| {
+                    match r {
+                        Ok(Either::A(_)) => panic!("expected rx first"),
+                        Ok(Either::B(((), mut conn))) => {
+                            conn.disable_keep_alive();
+                            tx2.send(()).unwrap();
+                            conn
+                        }
+                        Err(Either::A((e, _))) => panic!("unexpected error {}", e),
+                        Err(Either::B((e, _))) => panic!("unexpected error {}", e),
+                    }
+                })
+        });
+
+    core.run(fut).unwrap();
+    child.join().unwrap();
+}
+
+#[test]
+fn disable_keep_alive_post_request() {
+    let mut core = Core::new().unwrap();
+    let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx1, rx1) = oneshot::channel();
+
+    let child = thread::spawn(move || {
+        let mut req = connect(&addr);
+        req.write_all(b"\
+            GET / HTTP/1.1\r\n\
+            Host: localhost\r\n\
+            \r\n\
+        ").unwrap();
+
+        let mut buf = [0; 1024 * 8];
+        loop {
+            let n = req.read(&mut buf).expect("reading 1");
+            if n < buf.len() {
+                if &buf[n - HELLO.len()..n] == HELLO.as_bytes() {
+                    break;
+                }
+            }
+        }
+
+        tx1.send(()).unwrap();
+
+        let nread = req.read(&mut buf).expect("keep-alive reading");
+        assert_eq!(nread, 0);
+    });
+
+    let dropped = Dropped::new();
+    let dropped2 = dropped.clone();
+    let fut = listener.incoming()
+        .into_future()
+        .map_err(|_| unreachable!())
+        .and_then(|(item, _incoming)| {
+            let (socket, _) = item.expect("accepted socket");
+            let transport = DebugStream {
+                stream: socket,
+                _debug: dropped2,
+            };
+            Http::<hyper::Chunk>::new().serve_connection(transport, HelloWorld)
+                .select2(rx1)
+                .then(|r| {
+                    match r {
+                        Ok(Either::A(_)) => panic!("expected rx first"),
+                        Ok(Either::B(((), mut conn))) => {
+                            conn.disable_keep_alive();
+                            conn
+                        }
+                        Err(Either::A((e, _))) => panic!("unexpected error {}", e),
+                        Err(Either::B((e, _))) => panic!("unexpected error {}", e),
+                    }
+                })
+        });
+
+    assert!(!dropped.load());
+    core.run(fut).unwrap();
+    // we must poll the Core one more time in order for Windows to drop
+    // the read-blocked socket.
+    //
+    // See https://github.com/carllerche/mio/issues/776
+    let timeout = Timeout::new(Duration::from_millis(10), &core.handle()).unwrap();
+    core.run(timeout).unwrap();
+    assert!(dropped.load());
+    child.join().unwrap();
+}
+
+#[test]
+fn empty_parse_eof_does_not_return_error() {
     let mut core = Core::new().unwrap();
     let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -573,7 +876,7 @@ fn no_proto_empty_parse_eof_does_not_return_error() {
 }
 
 #[test]
-fn no_proto_nonempty_parse_eof_returns_error() {
+fn nonempty_parse_eof_returns_error() {
     let mut core = Core::new().unwrap();
     let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -595,6 +898,191 @@ fn no_proto_nonempty_parse_eof_returns_error() {
     core.run(fut).unwrap_err();
 }
 
+#[test]
+fn returning_1xx_response_is_error() {
+    let mut core = Core::new().unwrap();
+    let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut buf = [0; 256];
+        tcp.read(&mut buf).unwrap();
+
+        let expected = "HTTP/1.1 500 ";
+        assert_eq!(s(&buf[..expected.len()]), expected);
+    });
+
+    let fut = listener.incoming()
+        .into_future()
+        .map_err(|_| unreachable!())
+        .and_then(|(item, _incoming)| {
+            let (socket, _) = item.unwrap();
+            Http::<hyper::Chunk>::new()
+                .serve_connection(socket, service_fn(|_| {
+                    Ok(Response::<hyper::Body>::new()
+                        .with_status(StatusCode::Continue))
+                }))
+                .map(|_| ())
+        });
+
+    core.run(fut).unwrap_err();
+}
+
+#[test]
+fn parse_errors_send_4xx_response() {
+    let mut core = Core::new().unwrap();
+    let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(b"GE T / HTTP/1.1\r\n\r\n").unwrap();
+        let mut buf = [0; 256];
+        tcp.read(&mut buf).unwrap();
+
+        let expected = "HTTP/1.1 400 ";
+        assert_eq!(s(&buf[..expected.len()]), expected);
+    });
+
+    let fut = listener.incoming()
+        .into_future()
+        .map_err(|_| unreachable!())
+        .and_then(|(item, _incoming)| {
+            let (socket, _) = item.unwrap();
+            Http::<hyper::Chunk>::new()
+                .serve_connection(socket, HelloWorld)
+                .map(|_| ())
+        });
+
+    core.run(fut).unwrap_err();
+}
+
+#[test]
+fn illegal_request_length_returns_400_response() {
+    let mut core = Core::new().unwrap();
+    let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(b"POST / HTTP/1.1\r\nContent-Length: foo\r\n\r\n").unwrap();
+        let mut buf = [0; 256];
+        tcp.read(&mut buf).unwrap();
+
+        let expected = "HTTP/1.1 400 ";
+        assert_eq!(s(&buf[..expected.len()]), expected);
+    });
+
+    let fut = listener.incoming()
+        .into_future()
+        .map_err(|_| unreachable!())
+        .and_then(|(item, _incoming)| {
+            let (socket, _) = item.unwrap();
+            Http::<hyper::Chunk>::new()
+                .serve_connection(socket, HelloWorld)
+                .map(|_| ())
+        });
+
+    core.run(fut).unwrap_err();
+}
+
+#[test]
+fn max_buf_size() {
+    let _ = pretty_env_logger::try_init();
+    let mut core = Core::new().unwrap();
+    let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    const MAX: usize = 16_000;
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(b"POST /").expect("write 1");
+        tcp.write_all(&vec![b'a'; MAX]).expect("write 2");
+        let mut buf = [0; 256];
+        tcp.read(&mut buf).expect("read 1");
+
+        let expected = "HTTP/1.1 431 ";
+        assert_eq!(s(&buf[..expected.len()]), expected);
+    });
+
+    let fut = listener.incoming()
+        .into_future()
+        .map_err(|_| unreachable!())
+        .and_then(|(item, _incoming)| {
+            let (socket, _) = item.unwrap();
+            Http::<hyper::Chunk>::new()
+                .max_buf_size(MAX)
+                .serve_connection(socket, HelloWorld)
+                .map(|_| ())
+        });
+
+    core.run(fut).unwrap_err();
+}
+
+#[test]
+fn streaming_body() {
+    let _ = pretty_env_logger::try_init();
+    let mut core = Core::new().unwrap();
+    let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &core.handle()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut buf = [0; 8192];
+        let mut sum = tcp.read(&mut buf).expect("read 1");
+
+        let expected = "HTTP/1.1 200 ";
+        assert_eq!(s(&buf[..expected.len()]), expected);
+
+        loop {
+            let n = tcp.read(&mut buf).expect("read loop");
+            sum += n;
+            if n == 0 {
+                break;
+            }
+        }
+        assert_eq!(sum, 1_007_089);
+    });
+
+    let fut = listener.incoming()
+        .into_future()
+        .map_err(|_| unreachable!())
+        .and_then(|(item, _incoming)| {
+            let (socket, _) = item.unwrap();
+            Http::<& &'static [u8]>::new()
+                .keep_alive(false)
+                .serve_connection(socket, service_fn(|_| {
+                    static S: &'static [&'static [u8]] = &[&[b'x'; 1_000] as &[u8]; 1_00] as _;
+                    let b = ::futures::stream::iter_ok(S.iter());
+                    Ok(Response::<futures::stream::IterOk<::std::slice::Iter<&'static [u8]>, ::hyper::Error>>::new()
+                        .with_body(b))
+                }))
+                .map(|_| ())
+        });
+
+    core.run(fut).unwrap();
+}
+
+#[test]
+fn remote_addr() {
+    let server = serve();
+
+    let mut req = connect(server.addr());
+    req.write_all(b"\
+        GET / HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        \r\n\
+    ").unwrap();
+    req.read(&mut [0; 256]).unwrap();
+
+    let client_addr = req.local_addr().unwrap();
+    assert_eq!(server.remote_addr(), client_addr);
+}
+
 // -------------------------------------------------
 // the Server that is used to run all the tests with
 // -------------------------------------------------
@@ -612,12 +1100,35 @@ impl Serve {
         &self.addr
     }
 
-    fn body(&self) -> Vec<u8> {
-        let mut buf = vec![];
-        while let Ok(Msg::Chunk(msg)) = self.msg_rx.try_recv() {
-            buf.extend(&msg);
+    pub fn remote_addr(&self) -> SocketAddr {
+        match self.msg_rx.recv() {
+            Ok(Msg::Addr(addr)) => addr,
+            other => panic!("expected remote addr, found: {:?}", other),
         }
-        buf
+    }
+
+    fn body(&self) -> Vec<u8> {
+        self.try_body().expect("body")
+    }
+
+    fn body_err(&self) -> hyper::Error {
+        self.try_body().expect_err("body_err")
+    }
+
+    fn try_body(&self) -> Result<Vec<u8>, hyper::Error> {
+        let mut buf = vec![];
+        loop {
+            match self.msg_rx.recv() {
+                Ok(Msg::Chunk(msg)) => {
+                    buf.extend(&msg);
+                },
+                Ok(Msg::Addr(_)) => {},
+                Ok(Msg::Error(e)) => return Err(e),
+                Ok(Msg::End) => break,
+                Err(e) => panic!("expected body, found: {:?}", e),
+            }
+        }
+        Ok(buf)
     }
 
     fn reply(&self) -> ReplyBuilder {
@@ -649,6 +1160,12 @@ impl<'a> ReplyBuilder<'a> {
     }
 }
 
+impl<'a> Drop for ReplyBuilder<'a> {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Reply::End);
+    }
+}
+
 impl Drop for Serve {
     fn drop(&mut self) {
         drop(self.shutdown_signal.take());
@@ -668,11 +1185,16 @@ enum Reply {
     Status(hyper::StatusCode),
     Headers(hyper::Headers),
     Body(Vec<u8>),
+    End,
 }
 
+#[derive(Debug)]
 enum Msg {
     //Head(Request),
+    Addr(SocketAddr),
     Chunk(Vec<u8>),
+    Error(hyper::Error),
+    End,
 }
 
 impl NewService for TestService {
@@ -693,10 +1215,23 @@ impl Service for TestService {
     type Error = hyper::Error;
     type Future = Box<Future<Item=Response, Error=hyper::Error>>;
     fn call(&self, req: Request) -> Self::Future {
-        let tx = self.tx.clone();
+        let tx1 = self.tx.clone();
+        let tx2 = self.tx.clone();
+
+        #[allow(deprecated)]
+        let remote_addr = req.remote_addr().expect("remote_addr");
+        tx1.lock().unwrap().send(Msg::Addr(remote_addr)).unwrap();
+
         let replies = self.reply.clone();
         Box::new(req.body().for_each(move |chunk| {
-            tx.lock().unwrap().send(Msg::Chunk(chunk.to_vec())).unwrap();
+            tx1.lock().unwrap().send(Msg::Chunk(chunk.to_vec())).unwrap();
+            Ok(())
+        }).then(move |result| {
+            let msg = match result {
+                Ok(()) => Msg::End,
+                Err(e) => Msg::Error(e),
+            };
+            tx2.lock().unwrap().send(msg).unwrap();
             Ok(())
         }).map(move |_| {
             let mut res = Response::new();
@@ -711,6 +1246,7 @@ impl Service for TestService {
                     Reply::Body(body) => {
                         res.set_body(body);
                     },
+                    Reply::End => break,
                 }
             }
             res
@@ -718,6 +1254,8 @@ impl Service for TestService {
     }
 
 }
+
+const HELLO: &'static str = "hello";
 
 struct HelloWorld;
 
@@ -728,7 +1266,10 @@ impl Service for HelloWorld {
     type Future = FutureResult<Self::Response, Self::Error>;
 
     fn call(&self, _req: Request) -> Self::Future {
-        future::ok(Response::new())
+        let mut response = Response::new();
+        response.headers_mut().set(hyper::header::ContentLength(HELLO.len() as u64));
+        response.set_body(HELLO);
+        future::ok(response)
     }
 }
 
@@ -746,7 +1287,6 @@ fn serve() -> Serve {
 
 struct ServeOptions {
     keep_alive_disabled: bool,
-    no_proto: bool,
     pipeline: bool,
     timeout: Option<Duration>,
 }
@@ -755,22 +1295,14 @@ impl Default for ServeOptions {
     fn default() -> Self {
         ServeOptions {
             keep_alive_disabled: false,
-            no_proto: env("HYPER_NO_PROTO", "1"),
             pipeline: false,
             timeout: None,
         }
     }
 }
 
-fn env(name: &str, val: &str) -> bool {
-    match ::std::env::var(name) {
-        Ok(var) => var == val,
-        Err(_) => false,
-    }
-}
-
 fn serve_with_options(options: ServeOptions) -> Serve {
-    let _ = pretty_env_logger::init();
+    let _ = pretty_env_logger::try_init();
 
     let (addr_tx, addr_rx) = mpsc::channel();
     let (msg_tx, msg_rx) = mpsc::channel();
@@ -780,13 +1312,12 @@ fn serve_with_options(options: ServeOptions) -> Serve {
     let addr = "127.0.0.1:0".parse().unwrap();
 
     let keep_alive = !options.keep_alive_disabled;
-    let no_proto = !options.no_proto;
     let pipeline = options.pipeline;
     let dur = options.timeout;
 
     let thread_name = format!("test-server-{:?}", dur);
     let thread = thread::Builder::new().name(thread_name).spawn(move || {
-        let mut srv = Http::new()
+        let srv = Http::new()
             .keep_alive(keep_alive)
             .pipeline(pipeline)
             .bind(&addr, TestService {
@@ -794,9 +1325,6 @@ fn serve_with_options(options: ServeOptions) -> Serve {
                 _timeout: dur,
                 reply: reply_rx,
             }).unwrap();
-        if no_proto {
-            srv.no_proto();
-        }
         addr_tx.send(srv.local_addr().unwrap()).unwrap();
         srv.run_until(shutdown_rx.then(|_| Ok(()))).unwrap();
     }).unwrap();
@@ -811,3 +1339,64 @@ fn serve_with_options(options: ServeOptions) -> Serve {
         thread: Some(thread),
     }
 }
+
+fn s(buf: &[u8]) -> &str {
+    ::std::str::from_utf8(buf).unwrap()
+}
+
+fn has_header(msg: &str, name: &str) -> bool {
+    let n = msg.find("\r\n\r\n").unwrap_or(msg.len());
+
+    msg[..n].contains(name)
+}
+
+struct DebugStream<T, D> {
+    stream: T,
+    _debug: D,
+}
+
+impl<T: Read, D> Read for DebugStream<T, D> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl<T: Write, D> Write for DebugStream<T, D> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+
+impl<T: AsyncWrite, D> AsyncWrite for DebugStream<T, D> {
+    fn shutdown(&mut self) -> futures::Poll<(), io::Error> {
+        self.stream.shutdown()
+    }
+}
+
+
+impl<T: AsyncRead, D> AsyncRead for DebugStream<T, D> {}
+
+#[derive(Clone)]
+struct Dropped(Arc<AtomicBool>);
+
+impl Dropped {
+    pub fn new() -> Dropped {
+        Dropped(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn load(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
